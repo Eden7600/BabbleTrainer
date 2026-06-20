@@ -1,0 +1,12 @@
+#   py -3.11 -m venv env_directml
+#   env_directml\Scripts\python -m pip install -U pip
+#   env_directml\Scripts\python -m pip install torch-directml
+#   env_directml\Scripts\python -m pip install -r requirements_directml.txt
+
+torchvision      # must match torch-directml's torch; pip resolves against the already-installed torch
+timm
+numpy
+opencv-python
+onnx
+onnxruntime
+onnxscript

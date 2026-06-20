@@ -11,15 +11,23 @@ if sys.platform == 'win32':
     print(Binaries)
 
 a = Analysis(
-    ['trainer_distsampler.py'],
+    ['train_frontend.py'],
     pathex=[],
     binaries=Binaries,
     datas=[],
-    hiddenimports=['onnx', 'onnx.onnx_cpp2py_export'], 
+    hiddenimports=['onnx', 'onnx.onnx_cpp2py_export'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[],
+    # The trainer needs only torch / torch_directml / timm / cv2 / numpy / onnx. The data-science stack
+    # (pandas, matplotlib, scipy, sklearn, pyarrow, pyzmq) gets pulled in as optional/transitive imports
+    # and each ships its OWN older msvcp140.dll — one of those stale MSVC runtimes shadows the system one
+    # and makes onnx's C extension (built against a newer runtime) fail with "DLL initialization routine
+    # failed". Excluding them fixes that AND massively slims the exe. onnxscript/onnxruntime are only the
+    # dynamo exporter + export(check=True) path (we use the legacy exporter, check=False) and also crash
+    # PyInstaller's analysis, so they go too.
+    excludes=['onnxscript', 'onnxruntime', 'pandas', 'matplotlib', 'scipy', 'sklearn',
+              'pyarrow', 'zmq', 'IPython'],
     noarchive=False,
     optimize=0,
 )
