@@ -5,14 +5,69 @@ from contextlib import nullcontext
 import torch
 
 
+def _bench_directml_device(d, iters=50, warmup=5):
+    """Average wall-clock seconds of a 2048x2048 matmul on DirectML device ``d``.
+
+    DirectML dispatches ops asynchronously, so the original veryold tester (which just stopped the
+    clock right after issuing ``x @ x``) mostly timed kernel *submission*, not execution. We force
+    completion by reading a scalar back to the host (``.item()``), which blocks until the matmul is
+    done — the matmul's result also makes the queue flush. We likewise materialize the input and run
+    a few warmup iterations first so adapter init / shader compilation isn't charged to the timings."""
+    import time
+
+    x = torch.randn(2048, 2048, device=d)
+    for _ in range(warmup):
+        (x @ x).sum().item()  # init adapter, compile kernels, flush the queue
+
+    times = []
+    for _ in range(iters):
+        x = torch.randn(2048, 2048, device=d)
+        x.sum().item()              # ensure the input is fully materialized before timing
+        start = time.perf_counter()
+        y = x @ x
+        y.sum().item()              # block until the matmul actually finishes
+        times.append(time.perf_counter() - start)
+    return sum(times) / len(times)
+
+
+def _fastest_directml_device(torch_directml):
+    """Benchmark every DirectML adapter with a 2048x2048 matmul and return the fastest one's index.
+
+    Ported from the veryold trainermin.py GPU tester (warm each adapter, time matmuls, keep the
+    lowest average), with reliable async-aware timing — see _bench_directml_device. Returns None if
+    no adapter could be timed (caller falls back to CPU)."""
+    best_time = float("inf")
+    best_idx = None
+    for i in range(torch_directml.device_count()):
+        try:
+            avg = _bench_directml_device(torch_directml.device(i))
+            print(i, torch_directml.device_name(i), avg, flush=True)
+        except Exception:
+            continue  # skip an adapter that fails to allocate/benchmark
+
+        if avg < best_time:
+            best_time = avg
+            best_idx = i
+    return best_idx
+
+
 def get_device():
-    """DirectML (any-vendor GPU on Windows), falling back to CPU if torch_directml is unavailable.
-    DEVICE=cpu forces CPU."""
-    if os.environ.get("DEVICE", "auto").lower() == "cpu":
+    """Fastest DirectML adapter (any-vendor GPU on Windows), falling back to CPU if torch_directml is
+    unavailable. DEVICE=cpu forces CPU; DEVICE=<int> forces a specific DirectML adapter index."""
+    forced = os.environ.get("DEVICE", "auto").lower()
+    if forced == "cpu":
         return torch.device("cpu")
     try:
         import torch_directml
-        return torch_directml.device()
+        if forced.isdigit():
+            return torch_directml.device(int(forced))
+        if torch_directml.device_count() <= 1:
+            return torch_directml.device()
+        best_idx = _fastest_directml_device(torch_directml)
+        if best_idx is None:
+            return torch.device("cpu")
+        print("Using DirectML device:", torch_directml.device_name(best_idx), flush=True)
+        return torch_directml.device(best_idx)
     except Exception:
         return torch.device("cpu")
 
