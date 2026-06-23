@@ -73,15 +73,29 @@ def selftest() -> int:
     print(f"[selftest] selected device: {device} (type={device.type})", flush=True)
     net = Dev.model_to(build_expr_net(pretrained=False), device).train()
     opt = Dev.make_adamw([{"params": list(net.parameters()), "lr": 1e-4}], device, 1e-4)
-    x = torch.randn(2, C.TEMPORAL_FRAMES, C.DUAL_INPUT_SIZE, C.DUAL_INPUT_SIZE)  # >1: BN needs >1 sample
-    tgt = torch.rand(2, C.EXPR_SLICE[1] - C.EXPR_SLICE[0], device=device)
+    # Make inputs on CPU and move them
+    x = torch.randn(2, C.TEMPORAL_FRAMES, C.DUAL_INPUT_SIZE, C.DUAL_INPUT_SIZE)
+    tgt = torch.rand(2, C.EXPR_SLICE[1] - C.EXPR_SLICE[0])
     opt.zero_grad()
     pred = net(Dev.to_input(x, device))
-    loss = reg_elementwise(pred, tgt).mean()
+    loss = reg_elementwise(pred, Dev.to_input(tgt, device)).mean()
     loss.backward()
     opt.step()
     print(f"[selftest] one train step OK on {device.type}, loss={float(loss.item()):.5f}", flush=True)
     return 0
+
+
+def check_ocl() -> int:
+    """Lightweight bundling gate: import the OpenCL backend and confirm it registered,"""
+    import torch
+    try:
+        import pytorch_ocl  # noqa: F401  (loads pt_ocl.so + libOpenCL.so.1; registers the 'ocl' backend)
+    except Exception as e:
+        print(f"[check-ocl] FAILED to import pytorch_ocl: {e!r}", flush=True)
+        return 1
+    ok = hasattr(torch, "ocl")
+    print(f"[check-ocl] pytorch_ocl import OK; 'ocl' backend registered: {ok}", flush=True)
+    return 0 if ok else 1
 
 
 def main():
@@ -94,7 +108,11 @@ def main():
                     help=f"gaze-loop steps (default {GAZE_STEPS}; BabbleTrainer's per-capture budget)")
     ap.add_argument("--selftest", action="store_true",
                     help="verify the compute backend (device select + one dummy train step) and exit")
+    ap.add_argument("--check-ocl", action="store_true",
+                    help="confirm the bundled OpenCL backend imports + registers (no kernel run) and exit")
     args = ap.parse_args()
+    if args.check_ocl:
+        sys.exit(check_ocl())
     if args.selftest:
         sys.exit(selftest())
     if not args.bin or not args.onnx:      # required for a real run (omitted only for --selftest)
