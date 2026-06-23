@@ -166,10 +166,12 @@ def build_consensus_heads(feat_dim, groups=None, hidden=None) -> nn.ModuleList:
 
 
 class MergedDualEye(nn.Module):
-    def __init__(self, tower: nn.Module, consensus: nn.ModuleList | None = None):
+    def __init__(self, tower: nn.Module, consensus: nn.ModuleList | None = None,
+                 emit_combined: bool = True):
         super().__init__()
         self.tower = tower
         self.consensus = consensus
+        self.emit_combined = emit_combined          # False: drop the 3 combined* output columns
         self.right_first = (C.OUTPUT_SIDE_ORDER[0] == "right")
         # Channel fusion (deployment): both eyes emit one shared value for these EXPR channels.
         self.fuse_source = C.EXPR_FUSE_SOURCE
@@ -221,8 +223,12 @@ class MergedDualEye(nn.Module):
         merged = merged.clamp(0.0, 1.0)
         if self.consensus is None:
             return merged
+        if self.gather_idx is None and not self.emit_combined:
+            return merged                                           # head unused (no consensus fusion) and not emitted
         combined = torch.cat([h(feat_left, feat_right) for h in self.consensus], dim=1).clamp(0.0, 1.0)
         full = torch.cat([merged, combined], dim=1)
         if self.gather_idx is not None:
-            full = full.index_select(1, self.gather_idx)
+            full = full.index_select(1, self.gather_idx)            # fold consensus into the per-eye fused channels
+        if not self.emit_combined:
+            full = full[:, :merged.shape[1]]                        # keep the 12 per-eye outputs, drop combined*
         return full

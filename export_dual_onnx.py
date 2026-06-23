@@ -1,4 +1,5 @@
 import json
+import os
 
 import numpy as np
 import torch
@@ -38,8 +39,10 @@ def export(gaze_ckpt, expr_ckpt, out_path, check=False):
 def _export_tower(tower, backbone, out_path, check=False, consensus=None):
     import onnx
     device = "cpu"
-    merged = MergedDualEye(tower, consensus).to(device).eval()
-    names = C.BLENDSHAPE_NAMES_CONSENSUS if consensus is not None else C.BLENDSHAPE_NAMES
+    emit_combined = os.environ.get("EXPORT_COMBINED", "0") != "0"   # default: drop the 3 combined* outputs
+    merged = MergedDualEye(tower, consensus, emit_combined=emit_combined).to(device).eval()
+    names = (C.BLENDSHAPE_NAMES_CONSENSUS if (consensus is not None and emit_combined)
+             else C.BLENDSHAPE_NAMES)
 
     S, IN = C.DUAL_INPUT_SIZE, 2 * C.TEMPORAL_FRAMES
     dummy = torch.randn(1, IN, S, S, device=device)
@@ -61,9 +64,14 @@ def _export_tower(tower, backbone, out_path, check=False, consensus=None):
         mp.key, mp.value = key, value
     onnx.save(model, out_path)
 
+    if consensus is None:
+        cons_note = ""
+    elif emit_combined:
+        cons_note = "  +combined(3)"
+    else:
+        cons_note = "  (consensus used for fusion, combined outputs dropped)"
     print(f"Exported {out_path}")
-    print(f"  backbone={backbone}  input=(B,{IN},{S},{S})  output=(B,{len(names)})"
-          f"{'  +consensus(15)' if consensus is not None else ''}")
+    print(f"  backbone={backbone}  input=(B,{IN},{S},{S})  output=(B,{len(names)}){cons_note}")
     print(f"  blendshape_names={names}")
     if merged.fuse_channels:
         fused = [C.DUAL_PER_EYE[C.EXPR_SLICE[0] + c] for c in merged.fuse_channels]
