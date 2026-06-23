@@ -60,15 +60,45 @@ VAL_EVERY = 1000
 VAL_FRAC = 0.1
 
 
+def selftest() -> int:
+    """Backend self-check: select the compute device, build the real expr net, run one dummy
+    fwd+bwd+opt step, print the device, exit 0. Used by CI to validate the bundled OpenCL backend
+    (frozen binary under POCL) and by users to confirm `DEVICE=ocl` actually engages their GPU."""
+    import torch
+    import device as Dev
+    from model import reg_elementwise
+    from model_dual import build_expr_net
+
+    device = Dev.get_device()
+    print(f"[selftest] selected device: {device} (type={device.type})", flush=True)
+    net = Dev.model_to(build_expr_net(pretrained=False), device).train()
+    opt = Dev.make_adamw([{"params": list(net.parameters()), "lr": 1e-4}], device, 1e-4)
+    x = torch.randn(2, C.TEMPORAL_FRAMES, C.DUAL_INPUT_SIZE, C.DUAL_INPUT_SIZE)  # >1: BN needs >1 sample
+    tgt = torch.rand(2, C.EXPR_SLICE[1] - C.EXPR_SLICE[0], device=device)
+    opt.zero_grad()
+    pred = net(Dev.to_input(x, device))
+    loss = reg_elementwise(pred, tgt).mean()
+    loss.backward()
+    opt.step()
+    print(f"[selftest] one train step OK on {device.type}, loss={float(loss.item()):.5f}", flush=True)
+    return 0
+
+
 def main():
     ap = argparse.ArgumentParser(description="Train the dual-eye model on one .bin and export an ONNX.")
-    ap.add_argument("bin", help="input capture .bin")
-    ap.add_argument("onnx", help="output model .onnx")
+    ap.add_argument("bin", nargs="?", help="input capture .bin")
+    ap.add_argument("onnx", nargs="?", help="output model .onnx")
     ap.add_argument("--steps", type=int, default=STEPS,
                     help=f"expression-loop steps (default {STEPS})")
     ap.add_argument("--gaze-steps", type=int, default=GAZE_STEPS,
                     help=f"gaze-loop steps (default {GAZE_STEPS}; BabbleTrainer's per-capture budget)")
-    args = ap.parse_args()      # missing positionals -> argparse error + non-zero exit
+    ap.add_argument("--selftest", action="store_true",
+                    help="verify the compute backend (device select + one dummy train step) and exit")
+    args = ap.parse_args()
+    if args.selftest:
+        sys.exit(selftest())
+    if not args.bin or not args.onnx:      # required for a real run (omitted only for --selftest)
+        ap.error("the following arguments are required: bin, onnx")
     bin_path, out_onnx = args.bin, args.onnx
 
     tmp = tempfile.mkdtemp(prefix="qpro-train-")

@@ -42,7 +42,16 @@ jobs:
         run: |
           sudo apt update
           sudo apt install libopencv-dev
-          
+
+      # x86_64 Linux ships the OCL backend so PyInstaller bundles it; 
+      # pocl-opencl-icd is a CPU backed OCL device so the post build test can 
+      # execute ocl kernels on the CPU only runner
+      - name: Install OpenCL runtime (Linux x64)
+        if: ${{ matrix.result == 'Linux-x64' }}
+        run: |
+          sudo apt update
+          sudo apt install -y ocl-icd-libopencl1 pocl-opencl-icd clinfo
+
       #- name: Install OpenCV (Windows x64)
       #  if: ${{ matrix.result == 'Windows-x64' }}
       #  uses: johnwason/vcpkg-action@v7
@@ -87,7 +96,17 @@ jobs:
       - name: Execute Pyinstaller
         run: pyinstaller BabbleTrainer.spec
         working-directory: ./
-          
+
+      # Validate the bundled OpenCL backend and test against POCL's CPU OCL device. 
+      # Confirm the CPU fallback path after.
+      - name: Smoke-test OpenCL backend (Linux x64)
+        if: ${{ matrix.result == 'Linux-x64' }}
+        run: |
+          clinfo -l || true
+          DEVICE=ocl ./dist/BabbleTrainer --selftest
+          DEVICE=cpu ./dist/BabbleTrainer --selftest
+        working-directory: ./
+
       - name: Create Artifact
         uses: actions/upload-artifact@v5
         with:

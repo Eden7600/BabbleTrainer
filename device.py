@@ -51,12 +51,47 @@ def _fastest_directml_device(torch_directml):
     return best_idx
 
 
+_OCL_AVAILABLE = None  # cached result of the OpenCL device probe (see _ocl_available)
+
+
+def _ocl_available():
+    global _OCL_AVAILABLE
+    if _OCL_AVAILABLE is None:
+        try:
+            import pytorch_ocl  # noqa: F401  (registers the 'ocl' backend as a side effect of import)
+            torch.zeros(1, device="ocl:0")   # forces device + ICD load; raises if unusable
+            _OCL_AVAILABLE = True
+        except Exception:
+            _OCL_AVAILABLE = False
+    return _OCL_AVAILABLE
+
+
+def _auto_fallback():
+    """Default device when no backend is forced and DirectML isn't usable: CUDA if present (NVIDIA dev
+    boxes), else the OpenCL (pytorch_dlprim) backend if a GPU is reachable — the shipped cross-vendor
+    OCL path (AMD/Intel/NVIDIA) — else CPU."""
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if _ocl_available():
+        print("Using OpenCL (pytorch_dlprim) device", flush=True)
+        return torch.device("ocl:0")
+    return torch.device("cpu")
+
+
 def get_device():
-    """Fastest DirectML adapter (any-vendor GPU on Windows), falling back to CPU if torch_directml is
-    unavailable. DEVICE=cpu forces CPU; DEVICE=<int> forces a specific DirectML adapter index."""
+    """Device selection driven by the DEVICE env var.
+
+    DEVICE=cpu | cuda | ocl forces that backend; DEVICE=<int> forces a specific DirectML adapter
+    index; DEVICE=auto (default) picks the fastest DirectML adapter on Windows, else CUDA if
+    available, else the OpenCL backend if a GPU is reachable, else CPU."""
     forced = os.environ.get("DEVICE", "auto").lower()
     if forced == "cpu":
         return torch.device("cpu")
+    if forced == "cuda":
+        return torch.device("cuda")
+    if forced == "ocl":
+        import pytorch_ocl  # noqa: F401  (registers the 'ocl' backend as a side effect of import)
+        return torch.device("ocl:0")
     try:
         import torch_directml
         if forced.isdigit():
@@ -65,11 +100,11 @@ def get_device():
             return torch_directml.device()
         best_idx = _fastest_directml_device(torch_directml)
         if best_idx is None:
-            return torch.device("cpu")
+            return _auto_fallback()
         print("Using DirectML device:", torch_directml.device_name(best_idx), flush=True)
         return torch_directml.device(best_idx)
     except Exception:
-        return torch.device("cpu")
+        return _auto_fallback()
 
 
 def autocast_ctx(device):
@@ -137,6 +172,45 @@ class ForeachAdamW(torch.optim.Optimizer):
         return loss
 
 
+class ElementwiseAdamW(torch.optim.Optimizer):
+    """Per-parameter AdamW built only from mul_/add_/addcmul_/sqrt/addcdiv_ — no ``torch._foreach_*``
+    and no ``aten::lerp``. Mathematically identical to ForeachAdamW. The OpenCL (dlprim) backend
+    implements neither the foreach kernels nor lerp, so ForeachAdamW and stock torch.optim.AdamW both
+    error / silently fall back to CPU there (copying every param host<->device each step); this stays
+    on-device. Honors per-group lr + decoupled weight_decay just like ForeachAdamW."""
+
+    def __init__(self, params, lr=1e-3, betas=(0.9, 0.999), eps=1e-8, weight_decay=0.0):
+        super().__init__(params, dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay))
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        loss = closure() if closure is not None else None
+        for group in self.param_groups:
+            lr, (b1, b2), eps, wd = group["lr"], group["betas"], group["eps"], group["weight_decay"]
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+                g = p.grad
+                st = self.state[p]
+                if not st:
+                    st["step"] = 0
+                    st["m"] = torch.zeros_like(p)
+                    st["v"] = torch.zeros_like(p)
+                st["step"] += 1
+                t = st["step"]
+                m, v = st["m"], st["v"]
+                if wd:
+                    p.mul_(1 - lr * wd)                          # decoupled weight decay
+                m.mul_(b1).add_(g, alpha=1 - b1)                 # first moment
+                v.mul_(b2).addcmul_(g, g, value=1 - b2)          # second moment
+                denom = v.sqrt().div_(math.sqrt(1 - b2 ** t)).add_(eps)
+                p.addcdiv_(m, denom, value=-lr / (1 - b1 ** t))
+        return loss
+
+
 def make_adamw(param_groups, device, weight_decay):
-    """The lerp-free ForeachAdamW (torch's AdamW lerp falls back to CPU on DirectML)."""
+    """ElementwiseAdamW on the OpenCL backend (no foreach/lerp support there); the lerp-free
+    foreach ForeachAdamW everywhere else (torch's AdamW lerp falls back to CPU on DirectML)."""
+    if getattr(device, "type", None) == "ocl":
+        return ElementwiseAdamW(param_groups, weight_decay=weight_decay)
     return ForeachAdamW(param_groups, weight_decay=weight_decay)

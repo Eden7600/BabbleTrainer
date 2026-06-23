@@ -1,10 +1,19 @@
 --extra-index-url https://download.pytorch.org/whl/cpu
 
-# PyTorch: CPU for non-Windows
-torch==2.9.1+cpu; platform_system != "Windows"
+# PyTorch: CPU build for non-Windows. Pinned to 2.6.x because the OpenCL backend below is locked
+# to that torch minor version. The OpenCL backend then runs on top of this CPU build.
+torch==2.6.0+cpu; platform_system != "Windows"
 
 # PyTorch for Windows via DirectML backend
 torch-directml; platform_system == "Windows"
+
+# OpenCL (pytorch_dlprim) — the a cross-vendor GPU backend on Linux.
+# Prebuilt wheels exist only for x86_64 Linux and are locked to an exact (torch minor, cpython) pair,
+# so we direct-URL the matching wheel per Python via markers. arm64 / Windows / other Pythons skip it
+# (every marker false) and fall back to CPU/DirectML. NOTE: if CI's Python (3.12) changes, update here.
+pytorch_ocl @ https://github.com/artyom-beilis/pytorch_dlprim/releases/download/0.2.0/pytorch_ocl-0.2.0%2Btorch2.6-cp311-none-linux_x86_64.whl ; platform_system == "Linux" and platform_machine == "x86_64" and python_version == "3.11"
+pytorch_ocl @ https://github.com/artyom-beilis/pytorch_dlprim/releases/download/0.2.0/pytorch_ocl-0.2.0%2Btorch2.6-cp312-none-linux_x86_64.whl ; platform_system == "Linux" and platform_machine == "x86_64" and python_version == "3.12"
+pytorch_ocl @ https://github.com/artyom-beilis/pytorch_dlprim/releases/download/0.2.0/pytorch_ocl-0.2.0%2Btorch2.6-cp313-none-linux_x86_64.whl ; platform_system == "Linux" and platform_machine == "x86_64" and python_version == "3.13"
 
 # Common deps
 numpy
