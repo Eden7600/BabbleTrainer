@@ -6,6 +6,7 @@
 *.pt
 *.bin
 *.onnx
+*.npy
 /build
 /venv
 /dist

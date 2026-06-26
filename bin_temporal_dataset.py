@@ -374,7 +374,7 @@ class BinTemporalDataset(Dataset):
                 lam = random.random()
                 fa = self._load_frames(int(self.bin_id[ia]), int(self.pos[ia]), int(self.side[ia]))
                 fb = self._load_frames(int(self.bin_id[ib]), int(self.pos[ib]), int(self.side[ib]))
-                cur = _mixup_frames(fa, fb, lam, random.Random())
+                cur = _mixup_frames(fa, fb, lam, random)
                 lbl = ((1.0 - lam) * self.label[ia] + lam * self.label[ib]).astype(np.float32)
                 return (torch.from_numpy(cur), torch.from_numpy(lbl),
                         torch.tensor(0.0, dtype=torch.float32))
@@ -383,7 +383,7 @@ class BinTemporalDataset(Dataset):
         label = torch.from_numpy(self.label[i].copy())
         gv = torch.tensor(float(self.gaze_valid[i]), dtype=torch.float32)
 
-        cur = self._stack(bid, pos, side, random.Random() if self.augment else None)
+        cur = self._stack(bid, pos, side, random if self.augment else None)
         return torch.from_numpy(cur), label, gv
 
     def sampler_weights(self, active_boost: float = 4.0, gaze_boost: float = 4.0,
@@ -473,8 +473,8 @@ class BinPairedEyeDataset(Dataset):
         aug = self.base.augment
         # Independent augmentation per eye (the two eyes are different images); the evenness loss is a
         # gentle agree-gated pull, so this doubles as light L/R aug-consistency.
-        left = self.base._stack(b, p, self.canon_side, random.Random() if aug else None)
-        right = self.base._stack(b, p, self.mirror_side, random.Random() if aug else None)
+        left = self.base._stack(b, p, self.canon_side, random if aug else None)
+        right = self.base._stack(b, p, self.mirror_side, random if aug else None)
         ll = torch.from_numpy(self.base.label[ic].copy())
         rl = torch.from_numpy(self.base.label[im].copy())
         return torch.from_numpy(left), torch.from_numpy(right), ll, rl
@@ -580,10 +580,10 @@ class FootageUnlabeledDataset(Dataset):
         cur_frames = self._frames(fi, side)
         pair_ok = 1.0 if fi >= 1 else 0.0
         if self.augment:
-            cur_strong = _frames_to_stack(_aug_stack(cur_frames, random.Random()))
-            g_weak = sample_geom(strong=False, rng=random.Random())
-            cur_weak = _frames_to_stack(_aug_weak(cur_frames, random.Random(), g_weak))
-            nbr_weak = (_frames_to_stack(_aug_weak(self._frames(fi - 1, side), random.Random(), g_weak))
+            cur_strong = _frames_to_stack(_aug_stack(cur_frames, random))
+            g_weak = sample_geom(strong=False, rng=random)
+            cur_weak = _frames_to_stack(_aug_weak(cur_frames, random, g_weak))
+            nbr_weak = (_frames_to_stack(_aug_weak(self._frames(fi - 1, side), random, g_weak))
                         if pair_ok else cur_weak.copy())
         else:
             cur_strong = cur_weak = _frames_to_stack(cur_frames)

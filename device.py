@@ -1,7 +1,9 @@
 import math
 import os
+import random
 from contextlib import nullcontext
 
+import numpy as np
 import torch
 
 
@@ -185,14 +187,27 @@ def configure_runtime(device):
         torch.set_num_threads(max(1, phys))
 
 
+def seed_everything(seed):
+    """Seed python/numpy/torch (+CUDA) RNGs for reproducible training. Worker RNGs are seeded in
+    worker_init from the (now-deterministic) per-worker torch seed."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
 def worker_init(_):
-    """DataLoader workers run single-threaded for cv2 + torch so N workers stay N threads, not N*cores.
-    BB_CV2_THREADS=0 disables (baseline)."""
+    """DataLoader workers: single-thread cv2/torch (BB_CV2_THREADS=0 disables) and seed python/numpy
+    RNGs from the worker's torch seed so augmentation/mixup are reproducible."""
     n = int(os.environ.get("BB_CV2_THREADS", "1"))
     if n > 0:
         import cv2
         cv2.setNumThreads(n)
         torch.set_num_threads(1)
+    s = torch.initial_seed() % (2 ** 32)
+    random.seed(s)
+    np.random.seed(s)
 
 
 class ForeachAdamW(torch.optim.Optimizer):

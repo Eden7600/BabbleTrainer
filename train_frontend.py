@@ -1,5 +1,4 @@
 import argparse
-import glob
 import os
 import shutil
 import sys
@@ -9,15 +8,11 @@ from pathlib import Path
 os.environ.setdefault("BACKBONE", "mobilenetv4_conv_small_050.e3000_r224_in1k")
 
 import config as C
+import device as Dev
 import bin_temporal_dataset as TD
 from train_dual import fit_expr_stages
 from train_gaze import fit_gaze
 from export_dual_onnx import export
-
-
-def _clear_stale_temp(prefix="qpro-train-"):
-    for d in glob.glob(os.path.join(tempfile.gettempdir(), prefix + "*")):
-        shutil.rmtree(d, ignore_errors=True)
 
 
 def app_dir() -> Path:
@@ -103,7 +98,7 @@ def main():
         ap.error("the following arguments are required: bin, onnx")
     bin_path, out_onnx = args.bin, args.onnx
 
-    _clear_stale_temp()
+    Dev.seed_everything(C.SEED)
     tmp = tempfile.mkdtemp(prefix="qpro-train-")
     index = os.path.join(tmp, "index.npz")
     try:
@@ -167,12 +162,6 @@ def main():
         print("Model exported to ONNX: " + out_onnx, flush=True)
         print("\nTraining completed successfully!\n", flush=True)
     finally:
-        for _name in ("train_expr", "train_gaze", "val_expr", "val_gaze", "train_paired"):
-            _ds = locals().get(_name)
-            if _ds is not None:
-                _ds.close()
-        import gc
-        gc.collect()
         shutil.rmtree(tmp, ignore_errors=True)
 
 
