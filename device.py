@@ -52,11 +52,29 @@ def _fastest_directml_device(torch_directml):
 
 
 def get_device():
-    """Fastest DirectML adapter (any-vendor GPU on Windows), falling back to CPU if torch_directml is
-    unavailable. DEVICE=cpu forces CPU; DEVICE=<int> forces a specific DirectML adapter index."""
+    """Pick a training device.
+
+    Priority: an NVIDIA CUDA GPU (native, fastest) -> the fastest DirectML adapter (any-vendor GPU on
+    Windows) -> CPU. Overrides via the DEVICE env var:
+      DEVICE=cpu           -> force CPU
+      DEVICE=cuda[:<idx>]  -> force a CUDA GPU (errors out if CUDA is unavailable)
+      DEVICE=<int>         -> CUDA index <idx> when CUDA is present, else DirectML adapter index
+    """
     forced = os.environ.get("DEVICE", "auto").lower()
     if forced == "cpu":
         return torch.device("cpu")
+
+    cuda_ok = torch.cuda.is_available()
+    if forced.startswith("cuda"):
+        # explicit request: honor it even if is_available() is wrong, but warn if it looks down
+        if not cuda_ok:
+            print("DEVICE=cuda requested but torch.cuda.is_available() is False; trying anyway.", flush=True)
+        return torch.device(forced)
+    if cuda_ok and (forced in ("auto", "") or forced.isdigit()):
+        idx = int(forced) if forced.isdigit() else torch.cuda.current_device()
+        print("Using CUDA device:", torch.cuda.get_device_name(idx), flush=True)
+        return torch.device("cuda", idx)
+
     try:
         import torch_directml
         if forced.isdigit():
@@ -72,20 +90,40 @@ def get_device():
         return torch.device("cpu")
 
 
+def _amp_dtype(device):
+    """Autocast dtype for a CUDA device, or None for fp32 (CPU / DirectML).
+
+    Prefer bf16 on Ampere+ (same exponent range as fp32, so no loss scaling needed); fall back to
+    fp16 (with a real GradScaler) on older CUDA GPUs."""
+    if getattr(device, "type", None) != "cuda":
+        return None
+    try:
+        if torch.cuda.is_bf16_supported():
+            return torch.bfloat16
+    except Exception:
+        pass
+    return torch.float16
+
+
 def autocast_ctx(device):
-    """No-op context — DirectML/CPU train fp32 (no mixed-precision autocast)."""
-    return nullcontext()
+    """Mixed-precision autocast on CUDA (bf16/fp16); no-op fp32 on DirectML/CPU."""
+    dt = _amp_dtype(device)
+    if dt is None:
+        return nullcontext()
+    return torch.autocast("cuda", dtype=dt)
 
 
 def make_scaler(device):
-    """Disabled GradScaler — a pass-through (scale/step/update are no-ops) so the training loop is
-    unchanged while running fp32 on DirectML/CPU."""
-    return torch.amp.GradScaler("cpu", enabled=False)
+    """GradScaler enabled only for CUDA fp16 (bf16 and fp32 don't need loss scaling). The training
+    loop's scaler.scale/step/update calls become pass-throughs when it is disabled."""
+    enabled = _amp_dtype(device) == torch.float16
+    return torch.amp.GradScaler("cuda" if enabled else "cpu", enabled=enabled)
 
 
 def to_input(t, device):
-    """Move a batch to the device (NCHW — DirectML/CPU don't use channels_last)."""
-    return t.to(device)
+    """Move a batch to the device (NCHW). non_blocking pairs with pinned host memory on CUDA; it is
+    ignored on DirectML/CPU."""
+    return t.to(device, non_blocking=True)
 
 
 def model_to(net, device):
@@ -94,7 +132,8 @@ def model_to(net, device):
 
 
 def pin_memory(device) -> bool:
-    return False
+    """Pin DataLoader host buffers for faster async H2D copies on CUDA only."""
+    return getattr(device, "type", None) == "cuda"
 
 
 class ForeachAdamW(torch.optim.Optimizer):

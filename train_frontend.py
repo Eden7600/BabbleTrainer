@@ -1,4 +1,5 @@
 import argparse
+import glob
 import os
 import shutil
 import sys
@@ -12,6 +13,11 @@ import bin_temporal_dataset as TD
 from train_dual import fit_expr_stages
 from train_gaze import fit_gaze
 from export_dual_onnx import export
+
+
+def _clear_stale_temp(prefix="qpro-train-"):
+    for d in glob.glob(os.path.join(tempfile.gettempdir(), prefix + "*")):
+        shutil.rmtree(d, ignore_errors=True)
 
 
 def app_dir() -> Path:
@@ -60,17 +66,44 @@ VAL_EVERY = 1000
 VAL_FRAC = 0.1
 
 
+def selftest() -> int:
+    """Report the training device that would be used (CUDA / DirectML / CPU) and run a tiny GPU op,
+    then exit. Lets you confirm the build picks up the GPU before committing to a long training run."""
+    import torch
+    import device as Dev
+    dev = Dev.get_device()
+    print(f"device          : {dev}", flush=True)
+    print(f"torch           : {torch.__version__}  (cuda runtime {torch.version.cuda})", flush=True)
+    print(f"cuda_available  : {torch.cuda.is_available()}", flush=True)
+    if getattr(dev, "type", None) == "cuda":
+        print(f"gpu             : {torch.cuda.get_device_name(dev.index or 0)}", flush=True)
+        print(f"bf16_supported  : {torch.cuda.is_bf16_supported()}", flush=True)
+        x = torch.randn(2048, 2048, device=dev)
+        with Dev.autocast_ctx(dev):
+            r = float((x @ x).sum())        # forces a real kernel + device sync
+        print(f"gpu_matmul_ok   : {r == r}  (autocast dtype {Dev._amp_dtype(dev)})", flush=True)
+    print("selftest OK", flush=True)
+    return 0
+
+
 def main():
     ap = argparse.ArgumentParser(description="Train the dual-eye model on one .bin and export an ONNX.")
-    ap.add_argument("bin", help="input capture .bin")
-    ap.add_argument("onnx", help="output model .onnx")
+    ap.add_argument("bin", nargs="?", help="input capture .bin")
+    ap.add_argument("onnx", nargs="?", help="output model .onnx")
     ap.add_argument("--steps", type=int, default=STEPS,
                     help=f"expression-loop steps (default {STEPS})")
     ap.add_argument("--gaze-steps", type=int, default=GAZE_STEPS,
                     help=f"gaze-loop steps (default {GAZE_STEPS}; BabbleTrainer's per-capture budget)")
-    args = ap.parse_args()      # missing positionals -> argparse error + non-zero exit
+    ap.add_argument("--selftest", action="store_true",
+                    help="report the selected training device (CUDA/DirectML/CPU) and exit")
+    args = ap.parse_args()
+    if args.selftest:
+        return selftest()
+    if not args.bin or not args.onnx:
+        ap.error("the following arguments are required: bin, onnx")
     bin_path, out_onnx = args.bin, args.onnx
 
+    _clear_stale_temp()
     tmp = tempfile.mkdtemp(prefix="qpro-train-")
     index = os.path.join(tmp, "index.npz")
     try:
@@ -134,6 +167,12 @@ def main():
         print("Model exported to ONNX: " + out_onnx, flush=True)
         print("\nTraining completed successfully!\n", flush=True)
     finally:
+        for _name in ("train_expr", "train_gaze", "val_expr", "val_gaze", "train_paired"):
+            _ds = locals().get(_name)
+            if _ds is not None:
+                _ds.close()
+        import gc
+        gc.collect()
         shutil.rmtree(tmp, ignore_errors=True)
 
 
