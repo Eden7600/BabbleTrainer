@@ -6,7 +6,7 @@ torch-directml; platform_system == "Windows"
 
 # Common deps
 numpy
-opencv-python
+opencv-python-headless
 pillow
 onnx
 onnxscript

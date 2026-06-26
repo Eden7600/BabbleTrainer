@@ -6,7 +6,7 @@
 torchvision      # must match torch-directml's torch; pip resolves against the already-installed torch
 timm
 numpy
-opencv-python
+opencv-python-headless
 onnx
 onnxruntime
 onnxscript
