@@ -64,8 +64,14 @@ def evaluate_expr(net, ds, device, n=4000):
     return val_mse, rs
 
 
-def default_workers():
-    return min(8, max(2, (os.cpu_count() or 8) // 4))
+def default_workers(device=None):
+    env = os.environ.get("BB_WORKERS")
+    if env is not None:
+        return int(env)
+    phys, _ = Dev._cpu_topology()
+    if getattr(device, "type", None) == "cuda":
+        return min(8, max(2, phys // 2))
+    return min(4, max(1, phys // 4))
 
 
 def fit_expr(train_ds, val_ds, *, steps, batch=64, workers=None, lr_head, lr_backbone, weight_decay=1e-4,
@@ -78,9 +84,10 @@ def fit_expr(train_ds, val_ds, *, steps, batch=64, workers=None, lr_head, lr_bac
              consensus=False, lambda_consensus=C.LAMBDA_CONSENSUS,
              progress_offset=0, progress_total=None, emit_header=True, emit_completion=True):
     
-    if workers is None:
-        workers = default_workers()
     device = Dev.get_device()
+    Dev.configure_runtime(device)
+    if workers is None:
+        workers = default_workers(device)
     total = progress_total if progress_total is not None else steps
     lr_warmup_head = lr_head if lr_warmup_head is None else lr_warmup_head
     do_even = even and paired_ds is not None
@@ -97,7 +104,7 @@ def fit_expr(train_ds, val_ds, *, steps, batch=64, workers=None, lr_head, lr_bac
     loader_kw = dict(batch_size=batch, sampler=sampler, num_workers=workers,
                      pin_memory=Dev.pin_memory(device), drop_last=True)
     if workers > 0:
-        loader_kw.update(persistent_workers=True, prefetch_factor=4, timeout=180)
+        loader_kw.update(persistent_workers=True, prefetch_factor=4, timeout=180, worker_init_fn=Dev.worker_init)
     loader = DataLoader(train_ds, **loader_kw)
 
     use_aj = (temporal or mean_teacher) and unlabeled_ds is not None
@@ -108,7 +115,7 @@ def fit_expr(train_ds, val_ds, *, steps, batch=64, workers=None, lr_head, lr_bac
         ukw = dict(batch_size=ub, shuffle=True, num_workers=uw,
                    pin_memory=Dev.pin_memory(device), drop_last=True)
         if uw > 0:
-            ukw.update(persistent_workers=True, prefetch_factor=4, timeout=180)
+            ukw.update(persistent_workers=True, prefetch_factor=4, timeout=180, worker_init_fn=Dev.worker_init)
         unlab_loader = DataLoader(unlabeled_ds, **ukw)
         unlab_it = iter(unlab_loader)
     paired_loader = paired_it = None
@@ -120,7 +127,7 @@ def fit_expr(train_ds, val_ds, *, steps, batch=64, workers=None, lr_head, lr_bac
         pkw = dict(batch_size=pbatch, sampler=psamp, num_workers=pwk,
                    pin_memory=Dev.pin_memory(device), drop_last=True)
         if pwk > 0:
-            pkw.update(persistent_workers=True, prefetch_factor=4, timeout=180)
+            pkw.update(persistent_workers=True, prefetch_factor=4, timeout=180, worker_init_fn=Dev.worker_init)
         paired_loader = DataLoader(paired_ds, **pkw)
         paired_it = iter(paired_loader)
 

@@ -52,9 +52,10 @@ def fit_gaze(train_ds, val_ds, *, steps=C.GAZE_STEPS, batch=C.GAZE_BATCH, worker
              lambda_cons=C.GAZE_LAMBDA_CONS, cons_rampup=C.GAZE_CONS_RAMPUP,
              unlabeled_ds=None, unlabeled_batch=None,
              progress_offset=0, progress_total=None, emit_header=True, emit_completion=True):
-    if workers is None:
-        workers = default_workers()
     device = Dev.get_device()
+    Dev.configure_runtime(device)
+    if workers is None:
+        workers = default_workers(device)
     total = progress_total if progress_total is not None else steps
     print(f"[gaze] device: {device.type} | MicroChad | in_chans: {C.TEMPORAL_FRAMES} | "
           f"batch: {batch} | workers: {workers}", flush=True)
@@ -64,7 +65,7 @@ def fit_gaze(train_ds, val_ds, *, steps=C.GAZE_STEPS, batch=C.GAZE_BATCH, worker
     loader_kw = dict(batch_size=batch, sampler=sampler, num_workers=workers,
                      pin_memory=Dev.pin_memory(device), drop_last=True)
     if workers > 0:
-        loader_kw.update(persistent_workers=True, prefetch_factor=4, timeout=180)
+        loader_kw.update(persistent_workers=True, prefetch_factor=4, timeout=180, worker_init_fn=Dev.worker_init)
     loader = DataLoader(train_ds, **loader_kw)
 
     net = Dev.model_to(build_gaze_net(), device)
@@ -83,7 +84,7 @@ def fit_gaze(train_ds, val_ds, *, steps=C.GAZE_STEPS, batch=C.GAZE_BATCH, worker
         ukw = dict(batch_size=ub, shuffle=True, num_workers=uw,
                    pin_memory=Dev.pin_memory(device), drop_last=True)
         if uw > 0:
-            ukw.update(persistent_workers=True, prefetch_factor=4, timeout=180)
+            ukw.update(persistent_workers=True, prefetch_factor=4, timeout=180, worker_init_fn=Dev.worker_init)
         unlab_loader = DataLoader(unlabeled_ds, **ukw)
         unlab_it = iter(unlab_loader)
     deployed = lambda: teacher.model if teacher is not None else net   # what evaluate/save use

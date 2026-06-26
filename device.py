@@ -136,6 +136,65 @@ def pin_memory(device) -> bool:
     return getattr(device, "type", None) == "cuda"
 
 
+def _parse_cpu_list(s):
+    out = set()
+    for part in s.split(","):
+        part = part.strip()
+        if "-" in part:
+            a, b = part.split("-"); out.update(range(int(a), int(b) + 1))
+        elif part:
+            out.add(int(part))
+    return out
+
+
+def _cpu_topology():
+    """(physical_cores, logical_cpus) within the current CPU-affinity mask."""
+    try:
+        allowed = set(os.sched_getaffinity(0))
+    except (AttributeError, OSError):
+        allowed = set(range(os.cpu_count() or 1))
+    logical = len(allowed)
+    try:
+        cores = set()
+        for c in allowed:
+            sl = open(f"/sys/devices/system/cpu/cpu{c}/topology/thread_siblings_list").read().strip()
+            sibs = _parse_cpu_list(sl) & allowed
+            cores.add(min(sibs) if sibs else c)
+        phys = len(cores) or logical
+    except Exception:
+        phys = max(1, logical // 2)
+    return phys, logical
+
+
+def configure_runtime(device):
+    """CPU: torch intra-op = physical cores (HT/idle lanes left for the bursty data workers; override
+    BB_TORCH_THREADS). CUDA: cudnn autotune (shapes are fixed) + TF32 (BB_CUDNN_BENCH=0 disables)."""
+    env = os.environ.get("BB_TORCH_THREADS")
+    if getattr(device, "type", None) == "cuda":
+        if env:
+            torch.set_num_threads(max(1, int(env)))
+        if os.environ.get("BB_CUDNN_BENCH", "1") != "0":
+            torch.backends.cudnn.benchmark = True
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        return
+    if env:
+        torch.set_num_threads(max(1, int(env)))
+    else:
+        phys, _ = _cpu_topology()
+        torch.set_num_threads(max(1, phys))
+
+
+def worker_init(_):
+    """DataLoader workers run single-threaded for cv2 + torch so N workers stay N threads, not N*cores.
+    BB_CV2_THREADS=0 disables (baseline)."""
+    n = int(os.environ.get("BB_CV2_THREADS", "1"))
+    if n > 0:
+        import cv2
+        cv2.setNumThreads(n)
+        torch.set_num_threads(1)
+
+
 class ForeachAdamW(torch.optim.Optimizer):
     """Lerp-free, foreach AdamW — mathematically identical to torch.optim.AdamW but built only from
     ops DirectML runs natively (mul/add/addcmul/sqrt/addcdiv). torch's AdamW uses aten::lerp for the
