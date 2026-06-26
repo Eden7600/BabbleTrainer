@@ -30,18 +30,30 @@ def deconfuse_weight(tgt: torch.Tensor) -> torch.Tensor:
     return f.clamp_min(0.0).prod(dim=1).to(tgt.dtype)
 
 
+def _eval_batches(ds, n, chunk=256):
+    cached = getattr(ds, "_eval_cache", None)
+    if cached is not None and cached[0] == n:
+        return cached[1]
+    idx = np.random.default_rng(0).choice(len(ds), size=min(n, len(ds)), replace=False)
+    batches = []
+    for s in range(0, len(idx), chunk):
+        items = [ds[int(j)] for j in idx[s:s + chunk]]
+        xb = (torch.stack([it[0] for it in items]) * 255.0).round_().clamp_(0, 255).to(torch.uint8)
+        batches.append((xb, torch.stack([it[1] for it in items]), torch.stack([it[2] for it in items])))
+    ds._eval_cache = (n, batches)
+    return batches
+
+
 @torch.no_grad()
 def evaluate_expr(net, ds, device, n=4000):
     net.eval()
-    idx = np.random.default_rng(0).choice(len(ds), size=min(n, len(ds)), replace=False)
     preds, tgts = [], []
-    for s in range(0, len(idx), 256):
-        batch = [ds[int(j)] for j in idx[s:s + 256]]
-        x = Dev.to_input(torch.stack([b[0] for b in batch]), device)
+    for xb, lbl, _gv in _eval_batches(ds, n):
+        x = Dev.to_input(xb.float().div_(255.0), device)
         with Dev.autocast_ctx(device):
             preds.append(net(x).float().cpu())
-        tgts.append(torch.stack([b[1] for b in batch]))
-    p = torch.cat(preds).clamp(0, 1).numpy()      
+        tgts.append(lbl)
+    p = torch.cat(preds).clamp(0, 1).numpy()
     t = torch.cat(tgts).numpy()[:, EXPR_A:EXPR_B]
     val_mse = float(((p - t) ** 2).mean())
     rs = []

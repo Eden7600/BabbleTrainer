@@ -11,7 +11,7 @@ import device as Dev
 import bin_temporal_dataset as TD
 from model import _cpu_state_dict, EMATeacher
 from model_dual import build_gaze_net, warm_start_gaze
-from train_dual import default_workers
+from train_dual import default_workers, _eval_batches
 
 GAZE_A, GAZE_B = C.GAZE_SLICE     # (0, 2)
 
@@ -24,15 +24,13 @@ def save_gaze_checkpoint(path, net, step, extra=None):
 @torch.no_grad()
 def evaluate_gaze(net, ds, device, n=4000):
     net.eval()
-    idx = np.random.default_rng(0).choice(len(ds), size=min(n, len(ds)), replace=False)
     preds, tgts, gvs = [], [], []
-    for s in range(0, len(idx), 256):
-        batch = [ds[int(j)] for j in idx[s:s + 256]]
-        x = Dev.to_input(torch.stack([b[0] for b in batch]), device)
+    for xb, lbl, gv in _eval_batches(ds, n):
+        x = Dev.to_input(xb.float().div_(255.0), device)
         with Dev.autocast_ctx(device):
             preds.append(net(x).float().cpu())
-        tgts.append(torch.stack([b[1] for b in batch]))
-        gvs.append(torch.stack([b[2] for b in batch]))
+        tgts.append(lbl)
+        gvs.append(gv)
     p = torch.cat(preds).clamp(0, 1).numpy()                 # [N,2]
     t = torch.cat(tgts).numpy()[:, GAZE_A:GAZE_B]            # [N,2]
     gv = torch.cat(gvs).numpy() > 0.5
