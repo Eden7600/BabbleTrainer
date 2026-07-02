@@ -1,0 +1,177 @@
+# mobilenetv4_conv_small_050 architecture in EXECUTION ORDER
+# model=mobilenetv4_conv_small_050.e3000_r224_in1k  in_chans=4  num_classes=4  drop_rate=0.2
+# pretrained=True
+# format: <dotted.name> | <ModuleType> | <config>
+==========================================================================
+
+### conv_stem
+conv_stem | Conv2d | in=4, out=32, k=3x3, stride=2x2, pad=1x1, groups=1, bias=False, depthwise=False
+
+### bn1
+bn1 | BatchNormAct2d | features=32, eps=1e-05, momentum=0.1, act=ReLU
+
+### blocks.0
+blocks.0.0.conv | Conv2d | in=32, out=16, k=3x3, stride=2x2, pad=1x1, groups=1, bias=False, depthwise=False
+blocks.0.0.bn1 | BatchNormAct2d | features=16, eps=1e-05, momentum=0.1, act=ReLU
+blocks.0.1.conv | Conv2d | in=16, out=16, k=1x1, stride=1x1, pad=0x0, groups=1, bias=False, depthwise=False
+blocks.0.1.bn1 | BatchNormAct2d | features=16, eps=1e-05, momentum=0.1, act=ReLU
+
+### blocks.1
+blocks.1.0.conv | Conv2d | in=16, out=48, k=3x3, stride=2x2, pad=1x1, groups=1, bias=False, depthwise=False
+blocks.1.0.bn1 | BatchNormAct2d | features=48, eps=1e-05, momentum=0.1, act=ReLU
+blocks.1.1.conv | Conv2d | in=48, out=32, k=1x1, stride=1x1, pad=0x0, groups=1, bias=False, depthwise=False
+blocks.1.1.bn1 | BatchNormAct2d | features=32, eps=1e-05, momentum=0.1, act=ReLU
+
+### blocks.2
+blocks.2.0.dw_start.conv | Conv2d | in=32, out=32, k=5x5, stride=1x1, pad=2x2, groups=32, bias=False, depthwise=True
+blocks.2.0.dw_start.bn | BatchNormAct2d | features=32, eps=1e-05, momentum=0.1, act=None
+blocks.2.0.pw_exp.conv | Conv2d | in=32, out=96, k=1x1, stride=1x1, pad=0x0, groups=1, bias=False, depthwise=False
+blocks.2.0.pw_exp.bn | BatchNormAct2d | features=96, eps=1e-05, momentum=0.1, act=ReLU
+blocks.2.0.dw_mid.conv | Conv2d | in=96, out=96, k=5x5, stride=2x2, pad=2x2, groups=96, bias=False, depthwise=True
+blocks.2.0.dw_mid.bn | BatchNormAct2d | features=96, eps=1e-05, momentum=0.1, act=ReLU
+blocks.2.0.pw_proj.conv | Conv2d | in=96, out=48, k=1x1, stride=1x1, pad=0x0, groups=1, bias=False, depthwise=False
+blocks.2.0.pw_proj.bn | BatchNormAct2d | features=48, eps=1e-05, momentum=0.1, act=None
+blocks.2.1.pw_exp.conv | Conv2d | in=48, out=96, k=1x1, stride=1x1, pad=0x0, groups=1, bias=False, depthwise=False
+blocks.2.1.pw_exp.bn | BatchNormAct2d | features=96, eps=1e-05, momentum=0.1, act=ReLU
+blocks.2.1.dw_mid.conv | Conv2d | in=96, out=96, k=3x3, stride=1x1, pad=1x1, groups=96, bias=False, depthwise=True
+blocks.2.1.dw_mid.bn | BatchNormAct2d | features=96, eps=1e-05, momentum=0.1, act=ReLU
+blocks.2.1.pw_proj.conv | Conv2d | in=96, out=48, k=1x1, stride=1x1, pad=0x0, groups=1, bias=False, depthwise=False
+blocks.2.1.pw_proj.bn | BatchNormAct2d | features=48, eps=1e-05, momentum=0.1, act=None
+blocks.2.2.pw_exp.conv | Conv2d | in=48, out=96, k=1x1, stride=1x1, pad=0x0, groups=1, bias=False, depthwise=False
+blocks.2.2.pw_exp.bn | BatchNormAct2d | features=96, eps=1e-05, momentum=0.1, act=ReLU
+blocks.2.2.dw_mid.conv | Conv2d | in=96, out=96, k=3x3, stride=1x1, pad=1x1, groups=96, bias=False, depthwise=True
+blocks.2.2.dw_mid.bn | BatchNormAct2d | features=96, eps=1e-05, momentum=0.1, act=ReLU
+blocks.2.2.pw_proj.conv | Conv2d | in=96, out=48, k=1x1, stride=1x1, pad=0x0, groups=1, bias=False, depthwise=False
+blocks.2.2.pw_proj.bn | BatchNormAct2d | features=48, eps=1e-05, momentum=0.1, act=None
+blocks.2.3.pw_exp.conv | Conv2d | in=48, out=96, k=1x1, stride=1x1, pad=0x0, groups=1, bias=False, depthwise=False
+blocks.2.3.pw_exp.bn | BatchNormAct2d | features=96, eps=1e-05, momentum=0.1, act=ReLU
+blocks.2.3.dw_mid.conv | Conv2d | in=96, out=96, k=3x3, stride=1x1, pad=1x1, groups=96, bias=False, depthwise=True
+blocks.2.3.dw_mid.bn | BatchNormAct2d | features=96, eps=1e-05, momentum=0.1, act=ReLU
+blocks.2.3.pw_proj.conv | Conv2d | in=96, out=48, k=1x1, stride=1x1, pad=0x0, groups=1, bias=False, depthwise=False
+blocks.2.3.pw_proj.bn | BatchNormAct2d | features=48, eps=1e-05, momentum=0.1, act=None
+blocks.2.4.pw_exp.conv | Conv2d | in=48, out=96, k=1x1, stride=1x1, pad=0x0, groups=1, bias=False, depthwise=False
+blocks.2.4.pw_exp.bn | BatchNormAct2d | features=96, eps=1e-05, momentum=0.1, act=ReLU
+blocks.2.4.dw_mid.conv | Conv2d | in=96, out=96, k=3x3, stride=1x1, pad=1x1, groups=96, bias=False, depthwise=True
+blocks.2.4.dw_mid.bn | BatchNormAct2d | features=96, eps=1e-05, momentum=0.1, act=ReLU
+blocks.2.4.pw_proj.conv | Conv2d | in=96, out=48, k=1x1, stride=1x1, pad=0x0, groups=1, bias=False, depthwise=False
+blocks.2.4.pw_proj.bn | BatchNormAct2d | features=48, eps=1e-05, momentum=0.1, act=None
+blocks.2.5.dw_start.conv | Conv2d | in=48, out=48, k=3x3, stride=1x1, pad=1x1, groups=48, bias=False, depthwise=True
+blocks.2.5.dw_start.bn | BatchNormAct2d | features=48, eps=1e-05, momentum=0.1, act=None
+blocks.2.5.pw_exp.conv | Conv2d | in=48, out=192, k=1x1, stride=1x1, pad=0x0, groups=1, bias=False, depthwise=False
+blocks.2.5.pw_exp.bn | BatchNormAct2d | features=192, eps=1e-05, momentum=0.1, act=ReLU
+blocks.2.5.pw_proj.conv | Conv2d | in=192, out=48, k=1x1, stride=1x1, pad=0x0, groups=1, bias=False, depthwise=False
+blocks.2.5.pw_proj.bn | BatchNormAct2d | features=48, eps=1e-05, momentum=0.1, act=None
+
+### blocks.3
+blocks.3.0.dw_start.conv | Conv2d | in=48, out=48, k=3x3, stride=1x1, pad=1x1, groups=48, bias=False, depthwise=True
+blocks.3.0.dw_start.bn | BatchNormAct2d | features=48, eps=1e-05, momentum=0.1, act=None
+blocks.3.0.pw_exp.conv | Conv2d | in=48, out=288, k=1x1, stride=1x1, pad=0x0, groups=1, bias=False, depthwise=False
+blocks.3.0.pw_exp.bn | BatchNormAct2d | features=288, eps=1e-05, momentum=0.1, act=ReLU
+blocks.3.0.dw_mid.conv | Conv2d | in=288, out=288, k=3x3, stride=2x2, pad=1x1, groups=288, bias=False, depthwise=True
+blocks.3.0.dw_mid.bn | BatchNormAct2d | features=288, eps=1e-05, momentum=0.1, act=ReLU
+blocks.3.0.pw_proj.conv | Conv2d | in=288, out=64, k=1x1, stride=1x1, pad=0x0, groups=1, bias=False, depthwise=False
+blocks.3.0.pw_proj.bn | BatchNormAct2d | features=64, eps=1e-05, momentum=0.1, act=None
+blocks.3.1.dw_start.conv | Conv2d | in=64, out=64, k=5x5, stride=1x1, pad=2x2, groups=64, bias=False, depthwise=True
+blocks.3.1.dw_start.bn | BatchNormAct2d | features=64, eps=1e-05, momentum=0.1, act=None
+blocks.3.1.pw_exp.conv | Conv2d | in=64, out=256, k=1x1, stride=1x1, pad=0x0, groups=1, bias=False, depthwise=False
+blocks.3.1.pw_exp.bn | BatchNormAct2d | features=256, eps=1e-05, momentum=0.1, act=ReLU
+blocks.3.1.dw_mid.conv | Conv2d | in=256, out=256, k=5x5, stride=1x1, pad=2x2, groups=256, bias=False, depthwise=True
+blocks.3.1.dw_mid.bn | BatchNormAct2d | features=256, eps=1e-05, momentum=0.1, act=ReLU
+blocks.3.1.pw_proj.conv | Conv2d | in=256, out=64, k=1x1, stride=1x1, pad=0x0, groups=1, bias=False, depthwise=False
+blocks.3.1.pw_proj.bn | BatchNormAct2d | features=64, eps=1e-05, momentum=0.1, act=None
+blocks.3.2.pw_exp.conv | Conv2d | in=64, out=256, k=1x1, stride=1x1, pad=0x0, groups=1, bias=False, depthwise=False
+blocks.3.2.pw_exp.bn | BatchNormAct2d | features=256, eps=1e-05, momentum=0.1, act=ReLU
+blocks.3.2.dw_mid.conv | Conv2d | in=256, out=256, k=5x5, stride=1x1, pad=2x2, groups=256, bias=False, depthwise=True
+blocks.3.2.dw_mid.bn | BatchNormAct2d | features=256, eps=1e-05, momentum=0.1, act=ReLU
+blocks.3.2.pw_proj.conv | Conv2d | in=256, out=64, k=1x1, stride=1x1, pad=0x0, groups=1, bias=False, depthwise=False
+blocks.3.2.pw_proj.bn | BatchNormAct2d | features=64, eps=1e-05, momentum=0.1, act=None
+blocks.3.3.pw_exp.conv | Conv2d | in=64, out=192, k=1x1, stride=1x1, pad=0x0, groups=1, bias=False, depthwise=False
+blocks.3.3.pw_exp.bn | BatchNormAct2d | features=192, eps=1e-05, momentum=0.1, act=ReLU
+blocks.3.3.dw_mid.conv | Conv2d | in=192, out=192, k=5x5, stride=1x1, pad=2x2, groups=192, bias=False, depthwise=True
+blocks.3.3.dw_mid.bn | BatchNormAct2d | features=192, eps=1e-05, momentum=0.1, act=ReLU
+blocks.3.3.pw_proj.conv | Conv2d | in=192, out=64, k=1x1, stride=1x1, pad=0x0, groups=1, bias=False, depthwise=False
+blocks.3.3.pw_proj.bn | BatchNormAct2d | features=64, eps=1e-05, momentum=0.1, act=None
+blocks.3.4.pw_exp.conv | Conv2d | in=64, out=256, k=1x1, stride=1x1, pad=0x0, groups=1, bias=False, depthwise=False
+blocks.3.4.pw_exp.bn | BatchNormAct2d | features=256, eps=1e-05, momentum=0.1, act=ReLU
+blocks.3.4.dw_mid.conv | Conv2d | in=256, out=256, k=3x3, stride=1x1, pad=1x1, groups=256, bias=False, depthwise=True
+blocks.3.4.dw_mid.bn | BatchNormAct2d | features=256, eps=1e-05, momentum=0.1, act=ReLU
+blocks.3.4.pw_proj.conv | Conv2d | in=256, out=64, k=1x1, stride=1x1, pad=0x0, groups=1, bias=False, depthwise=False
+blocks.3.4.pw_proj.bn | BatchNormAct2d | features=64, eps=1e-05, momentum=0.1, act=None
+blocks.3.5.pw_exp.conv | Conv2d | in=64, out=256, k=1x1, stride=1x1, pad=0x0, groups=1, bias=False, depthwise=False
+blocks.3.5.pw_exp.bn | BatchNormAct2d | features=256, eps=1e-05, momentum=0.1, act=ReLU
+blocks.3.5.dw_mid.conv | Conv2d | in=256, out=256, k=3x3, stride=1x1, pad=1x1, groups=256, bias=False, depthwise=True
+blocks.3.5.dw_mid.bn | BatchNormAct2d | features=256, eps=1e-05, momentum=0.1, act=ReLU
+blocks.3.5.pw_proj.conv | Conv2d | in=256, out=64, k=1x1, stride=1x1, pad=0x0, groups=1, bias=False, depthwise=False
+blocks.3.5.pw_proj.bn | BatchNormAct2d | features=64, eps=1e-05, momentum=0.1, act=None
+
+### blocks.4
+blocks.4.0.conv | Conv2d | in=64, out=480, k=1x1, stride=1x1, pad=0x0, groups=1, bias=False, depthwise=False
+blocks.4.0.bn1 | BatchNormAct2d | features=480, eps=1e-05, momentum=0.1, act=ReLU
+
+### global_pool
+global_pool.pool | AdaptiveAvgPool2d | AdaptiveAvgPool2d, output_size=1
+
+### conv_head
+conv_head | Conv2d | in=480, out=1280, k=1x1, stride=1x1, pad=0x0, groups=1, bias=False, depthwise=False
+
+### norm_head
+norm_head | BatchNormAct2d | features=1280, eps=1e-05, momentum=0.1, act=ReLU
+
+### flatten
+flatten | Flatten | Flatten
+
+### classifier
+classifier | Linear | in=1280, out=4, bias=True
+
+
+==========================================================================
+SUMMARY  (mobilenetv4_conv_small_050 / width-mult 0.5)
+==========================================================================
+pretrained            : True
+input                 : (1, 4, 128, 128) (reused input_ref.npy)
+total blocks          : 17
+blocks w/ residual add: 10
+distinct block classes: ['ConvBnAct', 'UniversalInvertedResidual']
+block class counts    : {'ConvBnAct': 5, 'UniversalInvertedResidual': 12}
+--------------------------------------------------------------------------
+STEM  conv_stem       : in=4, out=32, k=3x3, stride=2x2, pad=1x1, groups=1, bias=False, depthwise=False
+      bn1            : features=32, eps=1e-05, momentum=0.1, act=ReLU
+--------------------------------------------------------------------------
+HEAD  conv_head out   : 1280
+      norm_head      : features=1280, eps=1e-05, momentum=0.1, act=ReLU
+      classifier     : in=1280, out=4, bias=True
+      pre-logits dim : 1280
+--------------------------------------------------------------------------
+WIDTH-MULT (0.5) STAGE OUTPUT CHANNELS (hardcode these):
+      stem out       : 32
+      blocks.0  out :   16  (2 block(s))
+      blocks.1  out :   32  (2 block(s))
+      blocks.2  out :   48  (6 block(s))
+      blocks.3  out :   64  (6 block(s))
+      blocks.4  out :  480  (1 block(s))
+      conv_head out  : 1280
+      classifier     : 1280 -> 4
+--------------------------------------------------------------------------
+INTERMEDIATE SHAPES:
+      stem             (1, 32, 64, 64)
+      block_0_0        (1, 16, 32, 32)
+      block_0_1        (1, 16, 32, 32)
+      block_1_0        (1, 48, 16, 16)
+      block_1_1        (1, 32, 16, 16)
+      block_2_0        (1, 48, 8, 8)
+      block_2_1        (1, 48, 8, 8)
+      block_2_2        (1, 48, 8, 8)
+      block_2_3        (1, 48, 8, 8)
+      block_2_4        (1, 48, 8, 8)
+      block_2_5        (1, 48, 8, 8)
+      block_3_0        (1, 64, 4, 4)
+      block_3_1        (1, 64, 4, 4)
+      block_3_2        (1, 64, 4, 4)
+      block_3_3        (1, 64, 4, 4)
+      block_3_4        (1, 64, 4, 4)
+      block_3_5        (1, 64, 4, 4)
+      block_4_0        (1, 480, 4, 4)
+      conv_head        (1, 1280, 1, 1)
+      feat             (1, 1280)
+      logits           (1, 4)
+==========================================================================

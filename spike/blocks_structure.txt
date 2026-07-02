@@ -1,0 +1,76 @@
+# BLOCK-LEVEL connectivity map for the Burn forward
+# model=mobilenetv4_conv_small_050.e3000_r224_in1k  input=(1, 4, 128, 128)
+# For each block: class, in->out channels, spatial stride,
+# residual-skip add (True/False), ordered sub-convs (k/stride/groups).
+==========================================================================
+
+## stage blocks.0  (2 block(s))
+blocks.0.0 | ConvBnAct | in=32 -> out=16 | stride=2 | residual_add=False [attr:has_skip]
+    - conv: Conv2d k=3x3 stride=2 groups=1 in=32 out=16 depthwise=False
+blocks.0.1 | ConvBnAct | in=16 -> out=16 | stride=1 | residual_add=False [attr:has_skip]
+    - conv: Conv2d k=1x1 stride=1 groups=1 in=16 out=16 depthwise=False
+
+## stage blocks.1  (2 block(s))
+blocks.1.0 | ConvBnAct | in=16 -> out=48 | stride=2 | residual_add=False [attr:has_skip]
+    - conv: Conv2d k=3x3 stride=2 groups=1 in=16 out=48 depthwise=False
+blocks.1.1 | ConvBnAct | in=48 -> out=32 | stride=1 | residual_add=False [attr:has_skip]
+    - conv: Conv2d k=1x1 stride=1 groups=1 in=48 out=32 depthwise=False
+
+## stage blocks.2  (6 block(s))
+blocks.2.0 | UniversalInvertedResidual | in=32 -> out=48 | stride=2 | residual_add=False [attr:has_skip]
+    - dw_start.conv: Conv2d k=5x5 stride=1 groups=32 in=32 out=32 depthwise=True
+    - pw_exp.conv: Conv2d k=1x1 stride=1 groups=1 in=32 out=96 depthwise=False
+    - dw_mid.conv: Conv2d k=5x5 stride=2 groups=96 in=96 out=96 depthwise=True
+    - pw_proj.conv: Conv2d k=1x1 stride=1 groups=1 in=96 out=48 depthwise=False
+blocks.2.1 | UniversalInvertedResidual | in=48 -> out=48 | stride=1 | residual_add=True [attr:has_skip]
+    - pw_exp.conv: Conv2d k=1x1 stride=1 groups=1 in=48 out=96 depthwise=False
+    - dw_mid.conv: Conv2d k=3x3 stride=1 groups=96 in=96 out=96 depthwise=True
+    - pw_proj.conv: Conv2d k=1x1 stride=1 groups=1 in=96 out=48 depthwise=False
+blocks.2.2 | UniversalInvertedResidual | in=48 -> out=48 | stride=1 | residual_add=True [attr:has_skip]
+    - pw_exp.conv: Conv2d k=1x1 stride=1 groups=1 in=48 out=96 depthwise=False
+    - dw_mid.conv: Conv2d k=3x3 stride=1 groups=96 in=96 out=96 depthwise=True
+    - pw_proj.conv: Conv2d k=1x1 stride=1 groups=1 in=96 out=48 depthwise=False
+blocks.2.3 | UniversalInvertedResidual | in=48 -> out=48 | stride=1 | residual_add=True [attr:has_skip]
+    - pw_exp.conv: Conv2d k=1x1 stride=1 groups=1 in=48 out=96 depthwise=False
+    - dw_mid.conv: Conv2d k=3x3 stride=1 groups=96 in=96 out=96 depthwise=True
+    - pw_proj.conv: Conv2d k=1x1 stride=1 groups=1 in=96 out=48 depthwise=False
+blocks.2.4 | UniversalInvertedResidual | in=48 -> out=48 | stride=1 | residual_add=True [attr:has_skip]
+    - pw_exp.conv: Conv2d k=1x1 stride=1 groups=1 in=48 out=96 depthwise=False
+    - dw_mid.conv: Conv2d k=3x3 stride=1 groups=96 in=96 out=96 depthwise=True
+    - pw_proj.conv: Conv2d k=1x1 stride=1 groups=1 in=96 out=48 depthwise=False
+blocks.2.5 | UniversalInvertedResidual | in=48 -> out=48 | stride=1 | residual_add=True [attr:has_skip]
+    - dw_start.conv: Conv2d k=3x3 stride=1 groups=48 in=48 out=48 depthwise=True
+    - pw_exp.conv: Conv2d k=1x1 stride=1 groups=1 in=48 out=192 depthwise=False
+    - pw_proj.conv: Conv2d k=1x1 stride=1 groups=1 in=192 out=48 depthwise=False
+
+## stage blocks.3  (6 block(s))
+blocks.3.0 | UniversalInvertedResidual | in=48 -> out=64 | stride=2 | residual_add=False [attr:has_skip]
+    - dw_start.conv: Conv2d k=3x3 stride=1 groups=48 in=48 out=48 depthwise=True
+    - pw_exp.conv: Conv2d k=1x1 stride=1 groups=1 in=48 out=288 depthwise=False
+    - dw_mid.conv: Conv2d k=3x3 stride=2 groups=288 in=288 out=288 depthwise=True
+    - pw_proj.conv: Conv2d k=1x1 stride=1 groups=1 in=288 out=64 depthwise=False
+blocks.3.1 | UniversalInvertedResidual | in=64 -> out=64 | stride=1 | residual_add=True [attr:has_skip]
+    - dw_start.conv: Conv2d k=5x5 stride=1 groups=64 in=64 out=64 depthwise=True
+    - pw_exp.conv: Conv2d k=1x1 stride=1 groups=1 in=64 out=256 depthwise=False
+    - dw_mid.conv: Conv2d k=5x5 stride=1 groups=256 in=256 out=256 depthwise=True
+    - pw_proj.conv: Conv2d k=1x1 stride=1 groups=1 in=256 out=64 depthwise=False
+blocks.3.2 | UniversalInvertedResidual | in=64 -> out=64 | stride=1 | residual_add=True [attr:has_skip]
+    - pw_exp.conv: Conv2d k=1x1 stride=1 groups=1 in=64 out=256 depthwise=False
+    - dw_mid.conv: Conv2d k=5x5 stride=1 groups=256 in=256 out=256 depthwise=True
+    - pw_proj.conv: Conv2d k=1x1 stride=1 groups=1 in=256 out=64 depthwise=False
+blocks.3.3 | UniversalInvertedResidual | in=64 -> out=64 | stride=1 | residual_add=True [attr:has_skip]
+    - pw_exp.conv: Conv2d k=1x1 stride=1 groups=1 in=64 out=192 depthwise=False
+    - dw_mid.conv: Conv2d k=5x5 stride=1 groups=192 in=192 out=192 depthwise=True
+    - pw_proj.conv: Conv2d k=1x1 stride=1 groups=1 in=192 out=64 depthwise=False
+blocks.3.4 | UniversalInvertedResidual | in=64 -> out=64 | stride=1 | residual_add=True [attr:has_skip]
+    - pw_exp.conv: Conv2d k=1x1 stride=1 groups=1 in=64 out=256 depthwise=False
+    - dw_mid.conv: Conv2d k=3x3 stride=1 groups=256 in=256 out=256 depthwise=True
+    - pw_proj.conv: Conv2d k=1x1 stride=1 groups=1 in=256 out=64 depthwise=False
+blocks.3.5 | UniversalInvertedResidual | in=64 -> out=64 | stride=1 | residual_add=True [attr:has_skip]
+    - pw_exp.conv: Conv2d k=1x1 stride=1 groups=1 in=64 out=256 depthwise=False
+    - dw_mid.conv: Conv2d k=3x3 stride=1 groups=256 in=256 out=256 depthwise=True
+    - pw_proj.conv: Conv2d k=1x1 stride=1 groups=1 in=256 out=64 depthwise=False
+
+## stage blocks.4  (1 block(s))
+blocks.4.0 | ConvBnAct | in=64 -> out=480 | stride=1 | residual_add=False [attr:has_skip]
+    - conv: Conv2d k=1x1 stride=1 groups=1 in=64 out=480 depthwise=False

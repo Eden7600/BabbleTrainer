@@ -1,0 +1,9 @@
+Add  10
+Conv  46
+Flatten  1
+Gemm  1
+GlobalAveragePool  1
+Relu  30
+
+# total_nodes  89
+# unique_op_types  6

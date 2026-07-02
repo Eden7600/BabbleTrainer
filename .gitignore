@@ -1,0 +1,9 @@
+target/
+**/target/
+*.log
+# generated reference artifacts (reproducible from the spike/*.py scripts)
+*.onnx
+*.safetensors
+*.npy
+*.npz
+spike/intermediates/
