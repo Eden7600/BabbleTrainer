@@ -55,7 +55,7 @@ pub fn eval_gaze<BI: Backend>(
     model: &MicroChad<BI>, bin: &Bin, samples: &[Sample], val: &[usize], cache: &EyeCache, device: &BI::Device,
 ) -> (f32, f32, [f32; 2]) {
     use crate::data::{temporal_stack, S, T};
-    let sel: Vec<usize> = val.iter().cloned().filter(|&i| samples[i].gaze_valid > 0.5).collect();
+    let sel: Vec<usize> = val.iter().cloned().filter(|&i| samples[i].gaze_usable).collect();
     let sel = if sel.is_empty() { val.to_vec() } else { sel };
     let mut preds: Vec<f32> = Vec::new();
     let mut tgts: Vec<f32> = Vec::new();

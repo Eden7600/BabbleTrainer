@@ -64,7 +64,7 @@ pub fn gaze_weights(samples: &[Sample], subset: &[usize]) -> Weighted {
     let mut eg = 0usize;
     let mut ng = 0usize;
     let bucket = |s: &Sample| -> u8 {
-        let gaze = s.gaze_valid > 0.5;
+        let gaze = s.gaze_usable; // gaze_valid AND not a stuttered/stale-gaze frame
         let active = s.label[2..6].iter().cloned().fold(0.0, f32::max) > active_thresh;
         if gaze {
             if active || s.expr_unlabeled > 0.5 { 1 } else { 2 } // expr-gaze / neut-gaze

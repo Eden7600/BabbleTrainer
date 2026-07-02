@@ -4,15 +4,15 @@ use onnx_burn::data::{build_samples, parse_bin, EyeCache};
 use onnx_burn::train::{fit_expr, fit_gaze, ExprCfg, GazeCfg};
 
 type AB = Autodiff<Wgpu>;
-const BIN: &str = "../../../ModelData/user_cal.bin";
 
 fn main() {
     let device = Default::default();
-    let es: usize = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(300);
-    let gs: usize = std::env::args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(300);
+    let bin_path = std::env::args().nth(1).unwrap_or_else(|| "../../../ModelData/user_cal.bin".into());
+    let es: usize = std::env::args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(4000);
+    let gs: usize = std::env::args().nth(3).and_then(|s| s.parse().ok()).unwrap_or(3200);
 
-    println!("loading + indexing user_cal.bin ...");
-    let bin = parse_bin(BIN).expect("parse bin");
+    println!("loading + indexing {bin_path} ...");
+    let bin = parse_bin(&bin_path).expect("parse bin");
     let cache = EyeCache::default();
     let samples = build_samples(&bin, &cache);
     println!("{} eye-samples", samples.len());

@@ -191,12 +191,19 @@ impl EyeCache {
 }
 
 // A labeled per-eye sample referencing a record + side (built over good, non-blank eyes).
+// gaze_usable = gaze_valid AND not a stuttered/stale gaze frame (raw gaze identical to the previous
+// record's, which corrupts gaze labels — see the capture stutter issue).
 pub struct Sample {
     pub rec: usize,
     pub side: usize,
     pub label: [f32; 6],
     pub gaze_valid: f32,
     pub expr_unlabeled: f32,
+    pub gaze_usable: bool,
+}
+
+fn raw_gaze(fr: &Frame, side: usize) -> (f32, f32) {
+    if side == 0 { (fr.fields[5], fr.fields[6]) } else { (fr.fields[7], fr.fields[8]) }
 }
 
 // Build the sample index (mirror of build_index's good+non-blank per-eye enumeration).
@@ -211,7 +218,9 @@ pub fn build_samples(bin: &Bin, cache: &EyeCache) -> Vec<Sample> {
         let (gv, eu) = (fr.gaze_valid(), fr.expr_unlabeled());
         for (side, lab) in [(0usize, l), (1usize, r)] {
             if cache.get(bin, rec, side).is_some() {
-                out.push(Sample { rec, side, label: lab, gaze_valid: gv, expr_unlabeled: eu });
+                let sticky = rec > 0 && raw_gaze(&bin.frames[rec - 1], side) == raw_gaze(fr, side);
+                let gaze_usable = gv > 0.5 && !sticky;
+                out.push(Sample { rec, side, label: lab, gaze_valid: gv, expr_unlabeled: eu, gaze_usable });
             }
         }
     }
