@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-burn = { version = "0.21.0", features = ["autodiff", "cuda", "ndarray", "wgpu"] }
+burn = { version = "0.21.0", features = ["autodiff", "ndarray", "wgpu", "vulkan"] }
 burn-store = "0.21.0"
 image = { version = "0.25.10", default-features = false, features = ["jpeg"] }
 npyz = { version = "0.9.1", features = ["npz"] }
@@ -13,3 +13,40 @@ rayon = "1.12.0"
 
 [build-dependencies]
 burn-import = "0.21.0"
+
+# Redirect the whole burn crate family to the local kernels-0.21 branch (adds the depthwise conv
+# kernels). All burn crates must be patched, not just burn+burn-store: the external burn-import /
+# burn-onnx build-dep family (crates.io) depends directly on burn-backend/burn-std/etc., and
+# leaving those on crates.io produces duplicate crate versions and type mismatches.
+[patch.crates-io]
+burn = { path = "../../../burn/crates/burn" }
+burn-autodiff = { path = "../../../burn/crates/burn-autodiff" }
+burn-backend = { path = "../../../burn/crates/burn-backend" }
+burn-candle = { path = "../../../burn/crates/burn-candle" }
+burn-collective = { path = "../../../burn/crates/burn-collective" }
+burn-communication = { path = "../../../burn/crates/burn-communication" }
+burn-core = { path = "../../../burn/crates/burn-core" }
+burn-cpu = { path = "../../../burn/crates/burn-cpu" }
+burn-cubecl = { path = "../../../burn/crates/burn-cubecl" }
+burn-cubecl-fusion = { path = "../../../burn/crates/burn-cubecl-fusion" }
+burn-cuda = { path = "../../../burn/crates/burn-cuda" }
+burn-dataset = { path = "../../../burn/crates/burn-dataset" }
+burn-derive = { path = "../../../burn/crates/burn-derive" }
+burn-dispatch = { path = "../../../burn/crates/burn-dispatch" }
+burn-flex = { path = "../../../burn/crates/burn-flex" }
+burn-fusion = { path = "../../../burn/crates/burn-fusion" }
+burn-ir = { path = "../../../burn/crates/burn-ir" }
+burn-ndarray = { path = "../../../burn/crates/burn-ndarray" }
+burn-nn = { path = "../../../burn/crates/burn-nn" }
+burn-optim = { path = "../../../burn/crates/burn-optim" }
+burn-remote = { path = "../../../burn/crates/burn-remote" }
+burn-rl = { path = "../../../burn/crates/burn-rl" }
+burn-rocm = { path = "../../../burn/crates/burn-rocm" }
+burn-router = { path = "../../../burn/crates/burn-router" }
+burn-std = { path = "../../../burn/crates/burn-std" }
+burn-store = { path = "../../../burn/crates/burn-store" }
+burn-tch = { path = "../../../burn/crates/burn-tch" }
+burn-tensor = { path = "../../../burn/crates/burn-tensor" }
+burn-train = { path = "../../../burn/crates/burn-train" }
+burn-vision = { path = "../../../burn/crates/burn-vision" }
+burn-wgpu = { path = "../../../burn/crates/burn-wgpu" }
