@@ -1,5 +1,6 @@
 pub mod aug;
 pub mod data;
+pub mod ema;
 pub mod eval;
 pub mod export;
 pub mod fast;

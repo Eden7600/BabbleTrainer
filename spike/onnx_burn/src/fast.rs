@@ -14,6 +14,7 @@ use rayon::prelude::*;
 
 use crate::aug;
 use crate::data::{process_eye, Bin, Sample, S, T};
+use crate::ema::ema_update;
 use crate::gaze::MicroChad;
 use crate::losses::supervised_deconfuse;
 use crate::mnv4::Mnv4;
@@ -263,6 +264,10 @@ pub fn fit_expr_fast<B: AutodiffBackend>(
     let rx = spawn_prefetch(frames.clone(), samples.clone(), w, cfg.batch, cfg.workers, true, 0xE47, pools);
     let mut model = Mnv4::<B>::new(T, 4, device);
     let mut opt = AdamWConfig::new().with_weight_decay(cfg.wd).init();
+    let mut teacher = model.valid(); // EMA teacher (what we deploy/export), matches BabbleTrainer
+    let ema_every = 16usize;
+    let keep = 0.997f64.powi(ema_every as i32) as f32; // EMA teacher; ~333-step horizon (converges well
+                                                       // inside the single-stage budget while smoothing)
     let mut best = f32::INFINITY;
     let mut win = Instant::now();
     for step in 0..cfg.steps {
@@ -272,19 +277,22 @@ pub fn fit_expr_fast<B: AutodiffBackend>(
         let loss = supervised_deconfuse(model.forward(x), y, device);
         let gp = GradientsParams::from_grads(loss.backward(), &model);
         model = opt.step(cos_lr(step, cfg.steps, cfg.warmup, cfg.lr), model, gp);
+        if step % ema_every == 0 {
+            teacher = ema_update::<B::InnerBackend, _>(teacher, &model.valid(), keep);
+        }
         if step % 100 == 99 {
             let dt = win.elapsed().as_secs_f32();
             println!("[expr {step:5}] {:.1} steps/s ({:.1} ms/step) windowed", 100.0 / dt, dt * 10.0);
             win = Instant::now();
         }
         if step % cfg.val_every == 0 || step == cfg.steps - 1 {
-            let vm = model.valid();
-            let (mse, r) = eval_expr(&vm, &frames, &samples, val, device);
+            teacher = ema_update::<B::InnerBackend, _>(teacher, &model.valid(), keep); // fold latest steps
+            let (mse, r) = eval_expr(&teacher, &frames, &samples, val, device);
             let tag = if mse < best { "*" } else { "" };
             println!("[expr {step:5}/{}] mse={mse:.5} r({:.3} {:.3} {:.3} {:.3}) {tag}", cfg.steps, r[0], r[1], r[2], r[3]);
             if mse < best {
                 best = mse;
-                vm.clone().save_file(ckpt, &NamedMpkFileRecorder::<FullPrecisionSettings>::new()).unwrap();
+                teacher.clone().save_file(ckpt, &NamedMpkFileRecorder::<FullPrecisionSettings>::new()).unwrap();
             }
         }
     }
@@ -302,6 +310,8 @@ pub fn fit_gaze_fast<B: AutodiffBackend>(
     let mut opt = AdamWConfig::new().with_weight_decay(cfg.wd).init();
     let mut best = f32::INFINITY;
     let mut win = Instant::now();
+    // Gaze deploys the STUDENT (BabbleTrainer only uses a gaze EMA teacher under semi-supervised
+    // mean-teacher, wired separately).
     for step in 0..cfg.steps {
         let (xs, ys) = rx.recv().unwrap();
         let x = Tensor::<B, 4>::from_data(TensorData::new(xs, [cfg.batch, T, S, S]), device);
