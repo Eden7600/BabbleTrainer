@@ -1,6 +1,9 @@
 pub mod data;
+pub mod eval;
+pub mod export;
 pub mod gaze;
 pub mod heads;
 pub mod losses;
 pub mod mnv4;
+pub mod sampler;
 pub mod train;
