@@ -4720,6 +4720,7 @@ dependencies = [
  "image",
  "npyz",
  "rand 0.10.1",
+ "rayon",
 ]
 
 [[package]]

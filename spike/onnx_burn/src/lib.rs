@@ -1,6 +1,7 @@
 pub mod data;
 pub mod eval;
 pub mod export;
+pub mod fast;
 pub mod gaze;
 pub mod heads;
 pub mod losses;
