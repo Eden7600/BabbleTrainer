@@ -12,6 +12,7 @@ use burn::record::{FullPrecisionSettings, NamedMpkFileRecorder};
 use burn::tensor::backend::AutodiffBackend;
 use rayon::prelude::*;
 
+use crate::aug;
 use crate::data::{process_eye, Bin, Sample, S, T};
 use crate::gaze::MicroChad;
 use crate::losses::supervised_deconfuse;
@@ -39,6 +40,32 @@ impl Frames {
                 None => out.extend(std::iter::repeat(0.0).take(S * S)),
             }
         }
+    }
+    fn stack_f32(&self, rec: usize, side: usize) -> Vec<f32> {
+        let mut out = Vec::with_capacity(T * S * S);
+        self.stack_into(rec, side, &mut out);
+        out
+    }
+}
+
+// Mixup source pools (expr only): neutral = max expr label < 0.2, expr = max expr label > 0.8, all =
+// the full train subset for general cross-frame blends.
+pub struct Pools {
+    neutral: Vec<usize>,
+    expr: Vec<usize>,
+    all: Vec<usize>,
+}
+impl Pools {
+    fn expr_build(samples: &[Sample], train: &[usize]) -> Self {
+        let m = |i: usize| samples[i].label[2..6].iter().cloned().fold(0.0f32, f32::max);
+        Self {
+            neutral: train.iter().cloned().filter(|&i| m(i) < 0.2).collect(),
+            expr: train.iter().cloned().filter(|&i| m(i) > 0.8).collect(),
+            all: train.to_vec(),
+        }
+    }
+    fn empty() -> Self {
+        Self { neutral: vec![], expr: vec![], all: vec![] }
     }
 }
 
@@ -86,18 +113,69 @@ fn build_batch(frames: &Frames, samples: &[Sample], idxs: &[usize], expr: bool) 
     (xs, ys)
 }
 
+// Training batch with augmentation. Expr: 50% neutral<->expression mixup, 15% cross-frame blend, else
+// strong photometric+geometric aug (the linearity + generalization drivers). Gaze: BabbleTrainer gaze
+// aug. Eval uses the plain build_batch (no aug).
+#[allow(clippy::too_many_arguments)]
+fn build_batch_train(
+    frames: &Frames, samples: &[Sample], idxs: &[usize], expr: bool, rng: &mut Rng, pools: &Pools,
+    scratch: &mut Vec<f32>,
+) -> Batch {
+    let b = idxs.len();
+    let m = if expr { 4 } else { 2 };
+    let mut xs = Vec::with_capacity(b * T * S * S);
+    let mut ys = Vec::with_capacity(b * m);
+    for &i in idxs {
+        let s = &samples[i];
+        if !expr {
+            let mut stack = frames.stack_f32(s.rec, s.side);
+            aug::aug_stack_gaze(&mut stack, rng, scratch);
+            xs.extend_from_slice(&stack);
+            ys.extend_from_slice(&s.label[0..2]);
+            continue;
+        }
+        let r = rng.f01();
+        let neutral_mix = r < 0.5 && !pools.neutral.is_empty() && !pools.expr.is_empty();
+        let cross_mix = !neutral_mix && r < 0.65 && pools.all.len() > 1;
+        if neutral_mix || cross_mix {
+            let (ia, ib) = if neutral_mix {
+                (pools.neutral[rng.usize(pools.neutral.len())], pools.expr[rng.usize(pools.expr.len())])
+            } else {
+                (pools.all[rng.usize(pools.all.len())], pools.all[rng.usize(pools.all.len())])
+            };
+            let lam = rng.f01();
+            let (sa, sb) = (&samples[ia], &samples[ib]);
+            let fa = frames.stack_f32(sa.rec, sa.side);
+            let fb = frames.stack_f32(sb.rec, sb.side);
+            xs.extend_from_slice(&aug::mixup_stacks(&fa, &fb, lam, rng, scratch));
+            for c in 0..4 {
+                ys.push((1.0 - lam) * sa.label[2 + c] + lam * sb.label[2 + c]);
+            }
+        } else {
+            let mut stack = frames.stack_f32(s.rec, s.side);
+            aug::aug_stack_expr(&mut stack, rng, scratch);
+            xs.extend_from_slice(&stack);
+            ys.extend_from_slice(&s.label[2..6]);
+        }
+    }
+    (xs, ys)
+}
+
 fn spawn_prefetch(
     frames: Arc<Frames>, samples: Arc<Vec<Sample>>, w: Arc<Weighted>, batch: usize, workers: usize,
-    expr: bool, seed: u64,
+    expr: bool, seed: u64, pools: Arc<Pools>,
 ) -> Receiver<Batch> {
     let (tx, rx) = sync_channel::<Batch>(workers * 2);
     for wi in 0..workers.max(1) {
-        let (frames, samples, w, tx) = (frames.clone(), samples.clone(), w.clone(), tx.clone());
+        let (frames, samples, w, tx, pools) =
+            (frames.clone(), samples.clone(), w.clone(), tx.clone(), pools.clone());
         thread::spawn(move || {
             let mut rng = Rng::new(seed.wrapping_add((wi as u64).wrapping_mul(2654435761)));
+            let mut scratch = Vec::new();
             loop {
                 let idxs: Vec<usize> = (0..batch).map(|_| w.sample(&mut rng)).collect();
-                if tx.send(build_batch(&frames, &samples, &idxs, expr)).is_err() {
+                let b = build_batch_train(&frames, &samples, &idxs, expr, &mut rng, &pools, &mut scratch);
+                if tx.send(b).is_err() {
                     break;
                 }
             }
@@ -181,7 +259,8 @@ pub fn fit_expr_fast<B: AutodiffBackend>(
     device: &B::Device, ckpt: &str,
 ) -> f32 {
     let w = Arc::new(Weighted::expr(&samples, train, 4.0));
-    let rx = spawn_prefetch(frames.clone(), samples.clone(), w, cfg.batch, cfg.workers, true, 0xE47);
+    let pools = Arc::new(Pools::expr_build(&samples, train));
+    let rx = spawn_prefetch(frames.clone(), samples.clone(), w, cfg.batch, cfg.workers, true, 0xE47, pools);
     let mut model = Mnv4::<B>::new(T, 4, device);
     let mut opt = AdamWConfig::new().with_weight_decay(cfg.wd).init();
     let mut best = f32::INFINITY;
@@ -217,7 +296,8 @@ pub fn fit_gaze_fast<B: AutodiffBackend>(
     device: &B::Device, ckpt: &str,
 ) -> f32 {
     let w = Arc::new(gaze_weights(&samples, train));
-    let rx = spawn_prefetch(frames.clone(), samples.clone(), w, cfg.batch, cfg.workers, false, 0x6A2E);
+    let pools = Arc::new(Pools::empty());
+    let rx = spawn_prefetch(frames.clone(), samples.clone(), w, cfg.batch, cfg.workers, false, 0x6A2E, pools);
     let mut model = MicroChad::<B>::new(T, 2, device);
     let mut opt = AdamWConfig::new().with_weight_decay(cfg.wd).init();
     let mut best = f32::INFINITY;

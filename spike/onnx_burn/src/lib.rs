@@ -1,3 +1,4 @@
+pub mod aug;
 pub mod data;
 pub mod eval;
 pub mod export;

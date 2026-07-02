@@ -20,16 +20,23 @@ impl Rng {
     }
 }
 
-// per-frame holdout: shuffle all sample indices, first val_frac -> val, rest -> train.
+// Block holdout (NOT per-frame random): samples are in capture order, so a random per-frame split
+// leaks — val frames are near-duplicates of temporally-adjacent train frames. Instead cut the timeline
+// into contiguous blocks and hold out every `stride`-th block, spread across the recording so val stays
+// representative of all routine sections while only block boundaries touch train. seed offsets which
+// blocks are held out.
 pub fn split(n: usize, val_frac: f32, seed: u64) -> (Vec<usize>, Vec<usize>) {
-    let mut idx: Vec<usize> = (0..n).collect();
-    let mut rng = Rng::new(seed);
-    for i in (1..n).rev() {
-        idx.swap(i, rng.usize(i + 1));
+    let bsize = 64usize; // small contiguous blocks: val spread finely over the timeline (representative
+                         // of every routine section) while only block edges touch train (~minimal leak)
+    let stride = (1.0 / val_frac).round().max(2.0) as usize; // hold every stride-th block (~10 for 0.1)
+    let off = (seed as usize) % stride;
+    let (mut train, mut val) = (Vec::new(), Vec::new());
+    for i in 0..n {
+        if (i / bsize) % stride == off { val.push(i) } else { train.push(i) }
     }
-    let nv = ((n as f32 * val_frac) as usize).max(1);
-    let val = idx[..nv].to_vec();
-    let train = idx[nv..].to_vec();
+    if val.is_empty() {
+        val.push(n - 1);
+    }
     (train, val)
 }
 
