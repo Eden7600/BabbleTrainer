@@ -7,7 +7,8 @@ use burn_store::{BurnToPyTorchAdapter, ModuleSnapshot, SafetensorsStore};
 pub fn save_pytorch<B: Backend, M: ModuleSnapshot<B>>(model: &M, path: &str) {
     let mut store = SafetensorsStore::from_file(path)
         .with_to_adapter(BurnToPyTorchAdapter)
-        .allow_partial(true);
+        .allow_partial(true)
+        .overwrite(true);
     model.save_into(&mut store).expect("save pytorch-format safetensors");
     println!("wrote {path}");
 }
