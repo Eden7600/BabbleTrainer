@@ -185,7 +185,7 @@ pub fn fit_expr_fast<B: AutodiffBackend>(
     let mut model = Mnv4::<B>::new(T, 4, device);
     let mut opt = AdamWConfig::new().with_weight_decay(cfg.wd).init();
     let mut best = f32::INFINITY;
-    let t0 = Instant::now();
+    let mut win = Instant::now();
     for step in 0..cfg.steps {
         let (xs, ys) = rx.recv().unwrap();
         let x = Tensor::<B, 4>::from_data(TensorData::new(xs, [cfg.batch, T, S, S]), device);
@@ -193,8 +193,10 @@ pub fn fit_expr_fast<B: AutodiffBackend>(
         let loss = supervised_deconfuse(model.forward(x), y, device);
         let gp = GradientsParams::from_grads(loss.backward(), &model);
         model = opt.step(cos_lr(step, cfg.steps, cfg.warmup, cfg.lr), model, gp);
-        if step % 200 == 199 {
-            println!("[expr {step:5}] {:.1} steps/s", (step + 1) as f32 / t0.elapsed().as_secs_f32());
+        if step % 100 == 99 {
+            let dt = win.elapsed().as_secs_f32();
+            println!("[expr {step:5}] {:.1} steps/s ({:.1} ms/step) windowed", 100.0 / dt, dt * 10.0);
+            win = Instant::now();
         }
         if step % cfg.val_every == 0 || step == cfg.steps - 1 {
             let vm = model.valid();
@@ -219,7 +221,7 @@ pub fn fit_gaze_fast<B: AutodiffBackend>(
     let mut model = MicroChad::<B>::new(T, 2, device);
     let mut opt = AdamWConfig::new().with_weight_decay(cfg.wd).init();
     let mut best = f32::INFINITY;
-    let t0 = Instant::now();
+    let mut win = Instant::now();
     for step in 0..cfg.steps {
         let (xs, ys) = rx.recv().unwrap();
         let x = Tensor::<B, 4>::from_data(TensorData::new(xs, [cfg.batch, T, S, S]), device);
@@ -227,8 +229,10 @@ pub fn fit_gaze_fast<B: AutodiffBackend>(
         let loss = (model.forward(x) - y).powf_scalar(2.0).mean();
         let gp = GradientsParams::from_grads(loss.backward(), &model);
         model = opt.step(cos_lr(step, cfg.steps, cfg.warmup, cfg.lr), model, gp);
-        if step % 200 == 199 {
-            println!("[gaze {step:5}] {:.1} steps/s", (step + 1) as f32 / t0.elapsed().as_secs_f32());
+        if step % 100 == 99 {
+            let dt = win.elapsed().as_secs_f32();
+            println!("[gaze {step:5}] {:.1} steps/s ({:.1} ms/step) windowed", 100.0 / dt, dt * 10.0);
+            win = Instant::now();
         }
         if step % cfg.val_every == 0 || step == cfg.steps - 1 {
             let vm = model.valid();
