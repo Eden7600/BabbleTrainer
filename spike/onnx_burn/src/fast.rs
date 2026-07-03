@@ -10,6 +10,7 @@ use burn::optim::{AdamWConfig, GradientsParams, Optimizer};
 use burn::prelude::*;
 use burn::record::{FullPrecisionSettings, NamedMpkFileRecorder};
 use burn::tensor::backend::AutodiffBackend;
+use burn_store::{ModuleSnapshot, PyTorchToBurnAdapter, SafetensorsStore};
 use rayon::prelude::*;
 
 use crate::aug;
@@ -217,6 +218,35 @@ pub struct FastCfg {
     pub workers: usize,
 }
 
+// Pretrained-backbone init (BabbleTrainer build_expr_net(pretrained=True)): load the timm
+// MNv4-conv-small-050 weights (4-ch stem + 4-out head already adapted) so the per-user calibration
+// starts from ImageNet features instead of random. mnv4_parity.rs proves this load matches timm
+// block-by-block. Returns true if the weights were found and loaded.
+fn load_pretrained_expr<B: Backend>(model: &mut Mnv4<B>) -> bool {
+    for path in ["../mnv4_weights.safetensors", "mnv4_weights.safetensors"] {
+        if std::path::Path::new(path).exists() {
+            let mut store = SafetensorsStore::from_file(path)
+                .with_from_adapter(PyTorchToBurnAdapter)
+                .with_key_remapping(r"(bn1|bn|norm_head)\.weight$", "${1}.gamma")
+                .with_key_remapping(r"(bn1|bn|norm_head)\.bias$", "${1}.beta")
+                .allow_partial(true)
+                .validate(false);
+            match model.load_from(&mut store) {
+                Ok(res) => {
+                    println!("[expr] pretrained init from {path}: {res}");
+                    return true;
+                }
+                Err(e) => {
+                    println!("[expr] pretrained load failed ({e}); random init");
+                    return false;
+                }
+            }
+        }
+    }
+    println!("[expr] no pretrained weights found; random init");
+    false
+}
+
 fn eval_expr<BI: Backend>(model: &Mnv4<BI>, frames: &Frames, samples: &[Sample], val: &[usize], device: &BI::Device) -> (f32, [f32; 4]) {
     let (mut preds, mut tgts) = (Vec::new(), Vec::new());
     for chunk in val.chunks(256) {
@@ -263,6 +293,7 @@ pub fn fit_expr_fast<B: AutodiffBackend>(
     let pools = Arc::new(Pools::expr_build(&samples, train));
     let rx = spawn_prefetch(frames.clone(), samples.clone(), w, cfg.batch, cfg.workers, true, 0xE47, pools);
     let mut model = Mnv4::<B>::new(T, 4, device);
+    load_pretrained_expr(&mut model);
     let mut opt = AdamWConfig::new().with_weight_decay(cfg.wd).init();
     let mut teacher = model.valid(); // EMA teacher (what we deploy/export), matches BabbleTrainer
     let ema_every = 16usize;
@@ -270,8 +301,17 @@ pub fn fit_expr_fast<B: AutodiffBackend>(
                                                        // inside the single-stage budget while smoothing)
     let mut best = f32::INFINITY;
     let mut win = Instant::now();
+    // BB_PROF=1: measure recv-wait = time the main thread blocks on the prefetch channel. Large => the
+    // aug workers can't keep up (aug/CPU-feed bound). ~0 => workers keep up, so any GPU under-use is the
+    // single-threaded op dispatch, not the aug (read GPU power externally to confirm).
+    let prof = std::env::var("BB_PROF").is_ok();
+    let mut recv_acc = 0f32;
     for step in 0..cfg.steps {
+        let r0 = Instant::now();
         let (xs, ys) = rx.recv().unwrap();
+        if prof {
+            recv_acc += r0.elapsed().as_secs_f32();
+        }
         let x = Tensor::<B, 4>::from_data(TensorData::new(xs, [cfg.batch, T, S, S]), device);
         let y = Tensor::<B, 2>::from_data(TensorData::new(ys, [cfg.batch, 4]), device);
         let loss = supervised_deconfuse(model.forward(x), y, device);
@@ -282,7 +322,13 @@ pub fn fit_expr_fast<B: AutodiffBackend>(
         }
         if step % 100 == 99 {
             let dt = win.elapsed().as_secs_f32();
-            println!("[expr {step:5}] {:.1} steps/s ({:.1} ms/step) windowed", 100.0 / dt, dt * 10.0);
+            if prof {
+                println!("[expr {step:5}] {:.1} ms/step | recv-wait(aug)={:.1} ms/step",
+                         dt * 10.0, recv_acc * 10.0);
+                recv_acc = 0.0;
+            } else {
+                println!("[expr {step:5}] {:.1} steps/s ({:.1} ms/step) windowed", 100.0 / dt, dt * 10.0);
+            }
             win = Instant::now();
         }
         if step % cfg.val_every == 0 || step == cfg.steps - 1 {
@@ -290,6 +336,101 @@ pub fn fit_expr_fast<B: AutodiffBackend>(
             let (mse, r) = eval_expr(&teacher, &frames, &samples, val, device);
             let tag = if mse < best { "*" } else { "" };
             println!("[expr {step:5}/{}] mse={mse:.5} r({:.3} {:.3} {:.3} {:.3}) {tag}", cfg.steps, r[0], r[1], r[2], r[3]);
+            if mse < best {
+                best = mse;
+                teacher.clone().save_file(ckpt, &NamedMpkFileRecorder::<FullPrecisionSettings>::new()).unwrap();
+            }
+        }
+    }
+    best
+}
+
+// 2-stage expression curriculum (BabbleTrainer fit_expr_stages), pretrained-backbone init, and
+// backbone/head param-group LRs with a frozen-backbone warmup. Total budget = cfg.steps (split 50/50
+// into stage A + stage B), batch = cfg.batch, so the per-user regime is preserved. Reference LRs are
+// batch-64 values scaled by sqrt(batch/64), matching config.py's own batch-scaling rule.
+//
+// Stage A: supervised (deconfuse) + mixup only; backbone frozen for the warmup, head-only at a higher
+// LR; then unfreeze with backbone 1e-4 / head 5e-4 (cosine); EMA stride 25.
+// Stage B: init continues from A (teacher reset); backbone 5e-5 / head 2e-4 (cosine); EMA stride 1.
+// (Consensus / evenness / mean-teacher are layered on top in later increments.)
+pub fn fit_expr_staged<B: AutodiffBackend>(
+    frames: Arc<Frames>, samples: Arc<Vec<Sample>>, train: &[usize], val: &[usize], cfg: &FastCfg,
+    device: &B::Device, ckpt: &str,
+) -> f32 {
+    let scale = (cfg.batch as f64 / 64.0).sqrt();
+    let a_steps = cfg.steps / 2;
+    let b_steps = cfg.steps - a_steps;
+    let warmup_a = (a_steps / 10).max(1);
+    let (lr_wu_head, a_lr_head, a_lr_bb) = (1e-3 * scale, 5e-4 * scale, 1e-4 * scale);
+    let (b_lr_head, b_lr_bb) = (2e-4 * scale, 5e-5 * scale);
+    let decay = 1.0 - 0.001 * (cfg.batch as f64 / 64.0); // per-step EMA decay (config EXPR_EMA_DECAY)
+
+    let w = Arc::new(Weighted::expr(&samples, train, 4.0));
+    let pools = Arc::new(Pools::expr_build(&samples, train));
+    let rx = spawn_prefetch(frames.clone(), samples.clone(), w, cfg.batch, cfg.workers, true, 0xE47, pools);
+
+    let mut model = Mnv4::<B>::new(T, 4, device);
+    if load_pretrained_expr(&mut model) {
+        model.small_init_head(device); // reference re-inits the head small after loading the backbone
+    }
+    let head_ids = model.head_ids();
+    let mut opt_head = AdamWConfig::new().with_weight_decay(cfg.wd).init();
+    let mut opt_bb = AdamWConfig::new().with_weight_decay(cfg.wd).init();
+
+    let mut teacher = model.valid();
+    let mut best = f32::INFINITY;
+    let mut win = Instant::now();
+    let cos = |p: f64| 0.5 * (1.0 + (std::f64::consts::PI * p).cos());
+
+    for step in 0..cfg.steps {
+        let stage_b = step >= a_steps;
+        // per-stage LR schedule + freeze + EMA stride
+        let (lr_head, lr_bb, frozen, ema_every) = if !stage_b {
+            let s = step;
+            if s < warmup_a {
+                (lr_wu_head, 0.0, true, 25usize) // frozen head-only warmup
+            } else {
+                let p = (s - warmup_a) as f64 / (a_steps - warmup_a).max(1) as f64;
+                (a_lr_head * cos(p), a_lr_bb * cos(p), false, 25)
+            }
+        } else {
+            let s = step - a_steps;
+            let p = s as f64 / b_steps.max(1) as f64;
+            (b_lr_head * cos(p), b_lr_bb * cos(p), false, 1)
+        };
+        if stage_b && step == a_steps {
+            teacher = model.valid(); // fresh teacher at stage B (matches reference EMATeacher reset)
+        }
+
+        let (xs, ys) = rx.recv().unwrap();
+        let x = Tensor::<B, 4>::from_data(TensorData::new(xs, [cfg.batch, T, S, S]), device);
+        let y = Tensor::<B, 2>::from_data(TensorData::new(ys, [cfg.batch, 4]), device);
+        let loss = supervised_deconfuse(model.forward(x), y, device);
+        let mut grads = loss.backward();
+        let head_gp = GradientsParams::from_params(&mut grads, &model, &head_ids);
+        let bb_gp = GradientsParams::from_module(&mut grads, &model); // remaining = backbone
+        model = opt_head.step(lr_head, model, head_gp);
+        if !frozen {
+            model = opt_bb.step(lr_bb, model, bb_gp);
+        }
+
+        if step % ema_every == 0 {
+            let keep = decay.powi(ema_every as i32) as f32;
+            teacher = ema_update::<B::InnerBackend, _>(teacher, &model.valid(), keep);
+        }
+        if step % 100 == 99 {
+            let dt = win.elapsed().as_secs_f32();
+            println!("[expr {step:5}] {:.1} ms/step ({}) windowed", dt * 10.0, if stage_b { "B" } else { "A" });
+            win = Instant::now();
+        }
+        if step % cfg.val_every == 0 || step == cfg.steps - 1 {
+            let keep = decay.powi(ema_every as i32) as f32;
+            teacher = ema_update::<B::InnerBackend, _>(teacher, &model.valid(), keep);
+            let (mse, r) = eval_expr(&teacher, &frames, &samples, val, device);
+            let tag = if mse < best { "*" } else { "" };
+            let st = if stage_b { "B" } else { "A" };
+            println!("[expr {st} {step:5}/{}] mse={mse:.5} r({:.3} {:.3} {:.3} {:.3}) {tag}", cfg.steps, r[0], r[1], r[2], r[3]);
             if mse < best {
                 best = mse;
                 teacher.clone().save_file(ckpt, &NamedMpkFileRecorder::<FullPrecisionSettings>::new()).unwrap();

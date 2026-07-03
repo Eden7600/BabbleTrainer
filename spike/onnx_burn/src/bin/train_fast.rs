@@ -4,7 +4,7 @@ use std::time::Instant;
 
 use burn::backend::{Autodiff, Wgpu};
 use onnx_burn::data::{parse_bin, process_eye, S, T};
-use onnx_burn::fast::{build_samples, fit_expr_fast, fit_gaze_fast, FastCfg, Frames};
+use onnx_burn::fast::{build_samples, fit_expr_staged, fit_gaze_fast, FastCfg, Frames};
 use onnx_burn::sampler::{split, Rng};
 
 type AB = Autodiff<Wgpu>;
@@ -74,7 +74,7 @@ fn main() {
     println!("{} eye-samples", samples.len());
     let (train, val) = split(samples.len(), 0.1, 1234);
 
-    let e = fit_expr_fast::<AB>(
+    let e = fit_expr_staged::<AB>(
         frames.clone(), samples.clone(), &train, &val,
         &FastCfg { steps: es, batch: 32, warmup: es / 10, val_every: (es / 4).max(1), lr: 5e-4, wd: 1e-4, workers },
         &device, "../ckpt_expr.mpk",

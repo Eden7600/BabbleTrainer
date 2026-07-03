@@ -159,6 +159,28 @@ impl<B: Backend> Mnv4<B> {
         self.classifier.forward(self.forward_features(x))
     }
 
+    // Classifier (head) param ids — used to split backbone vs head into separate optimizer groups.
+    pub fn head_ids(&self) -> Vec<burn::module::ParamId> {
+        let mut v = vec![self.classifier.weight.id];
+        if let Some(b) = &self.classifier.bias {
+            v.push(b.id);
+        }
+        v
+    }
+
+    // BabbleTrainer _small_init_head: weight ~ N(0, 0.01), bias = 0. Applied after loading a
+    // pretrained backbone so the fresh head starts near zero (outputs in-range) instead of inheriting
+    // the pretrained classifier's large logits.
+    pub fn small_init_head(&mut self, dev: &B::Device) {
+        let [din, dout] = self.classifier.weight.val().dims();
+        let w = Tensor::<B, 2>::random([din, dout], burn::tensor::Distribution::Normal(0.0, 0.01), dev);
+        self.classifier.weight = burn::module::Param::from_tensor(w);
+        if let Some(b) = self.classifier.bias.take() {
+            self.classifier.bias = Some(burn::module::Param::from_tensor(Tensor::<B, 1>::zeros([dout], dev)));
+            let _ = b;
+        }
+    }
+
     // Collect per-stage outputs for block-by-block parity. stem/conv_head are recorded CONV-ONLY to
     // match the reference hooks (which tapped conv_stem / conv_head before their BN+ReLU).
     pub fn forward_trace(&self, x: Tensor<B, 4>, trace: &mut Vec<(String, Vec<f32>)>) -> Tensor<B, 2> {
