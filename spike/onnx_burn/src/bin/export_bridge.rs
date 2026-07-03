@@ -2,8 +2,9 @@
 use burn::backend::NdArray;
 use burn::module::Module;
 use burn::record::{FullPrecisionSettings, NamedMpkFileRecorder};
-use onnx_burn::export::save_pytorch;
+use onnx_burn::export::{save_pytorch, save_pytorch_remap};
 use onnx_burn::gaze::MicroChad;
+use onnx_burn::heads::ConsensusHeads;
 use onnx_burn::mnv4::Mnv4;
 
 type B = NdArray<f32>;
@@ -21,4 +22,18 @@ fn main() {
         .load_file("../ckpt_gaze.mpk", &rec, &device)
         .expect("load gaze ckpt");
     save_pytorch(&gaze, "../gaze_pt.safetensors");
+
+    // Consensus heads are optional (only trained when the capture has paired eyes). If present, emit
+    // them on the Python ModuleList keys so the ONNX export produces the 15-dim (brow-fused) output.
+    if std::path::Path::new("../ckpt_cons.mpk").exists() {
+        let cons = ConsensusHeads::<B>::new(1280, &device)
+            .load_file("../ckpt_cons.mpk", &rec, &device)
+            .expect("load cons ckpt");
+        save_pytorch_remap(&cons, "../cons_pt.safetensors", r"^heads\.", "");
+        println!("wrote consensus heads");
+    } else {
+        // stale file from a previous no-consensus run would wrongly force a 15-dim export
+        let _ = std::fs::remove_file("../cons_pt.safetensors");
+        println!("no consensus ckpt; 12-dim export");
+    }
 }

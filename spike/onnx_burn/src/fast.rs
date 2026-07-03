@@ -17,7 +17,8 @@ use crate::aug;
 use crate::data::{process_eye, Bin, Sample, S, T};
 use crate::ema::ema_update;
 use crate::gaze::MicroChad;
-use crate::losses::supervised_deconfuse;
+use crate::heads::ConsensusHeads;
+use crate::losses::{consensus_term, evenness, supervised_deconfuse};
 use crate::mnv4::Mnv4;
 use crate::sampler::{gaze_weights, Rng, Weighted};
 
@@ -74,6 +75,82 @@ impl Pools {
 fn raw_gaze(bin: &Bin, rec: usize, side: usize) -> (f32, f32) {
     let f = &bin.frames[rec].fields;
     if side == 0 { (f[5], f[6]) } else { (f[7], f[8]) }
+}
+
+// Paired-eye index: records where BOTH sides are in `train`, with the 4-dim expr labels of each eye.
+// Drives the evenness (L/R symmetry) and consensus-head terms. active-boost weighted like the expr pool.
+pub struct Paired {
+    recs: Vec<usize>,
+    ll: Vec<[f32; 4]>,
+    rl: Vec<[f32; 4]>,
+    cum: Vec<f32>,
+    total: f32,
+}
+impl Paired {
+    fn build(samples: &[Sample], train: &[usize]) -> Self {
+        use std::collections::HashMap;
+        let (mut left, mut right) = (HashMap::new(), HashMap::new());
+        for &i in train {
+            let s = &samples[i];
+            let e = [s.label[2], s.label[3], s.label[4], s.label[5]];
+            if s.side == 0 { left.insert(s.rec, e); } else { right.insert(s.rec, e); }
+        }
+        let (mut recs, mut ll, mut rl, mut cum) = (vec![], vec![], vec![], vec![]);
+        let mut acc = 0.0f32;
+        let mut keys: Vec<usize> = left.keys().cloned().filter(|k| right.contains_key(k)).collect();
+        keys.sort_unstable();
+        for rec in keys {
+            let (l, r) = (left[&rec], right[&rec]);
+            let m = l.iter().chain(r.iter()).cloned().fold(0.0f32, f32::max);
+            acc += 1.0 + 4.0 * m;
+            recs.push(rec);
+            ll.push(l);
+            rl.push(r);
+            cum.push(acc);
+        }
+        Self { recs, ll, rl, cum, total: acc }
+    }
+    fn sample(&self, rng: &mut Rng) -> usize {
+        let u = rng.f01() * self.total;
+        self.cum.partition_point(|&c| c < u).min(self.cum.len().saturating_sub(1))
+    }
+    fn is_empty(&self) -> bool {
+        self.recs.is_empty()
+    }
+}
+
+type PairedBatch = (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>); // pl, pr, pll(4), prl(4)
+
+fn spawn_paired_prefetch(
+    frames: Arc<Frames>, paired: Arc<Paired>, pbatch: usize, workers: usize, seed: u64,
+) -> Receiver<PairedBatch> {
+    let (tx, rx) = sync_channel::<PairedBatch>(workers * 2);
+    for wi in 0..workers.max(1) {
+        let (frames, paired, tx) = (frames.clone(), paired.clone(), tx.clone());
+        thread::spawn(move || {
+            let mut rng = Rng::new(seed.wrapping_add((wi as u64).wrapping_mul(0x9E3779B1)));
+            let mut scratch = Vec::new();
+            loop {
+                let (mut pl, mut pr, mut pll, mut prl) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+                for _ in 0..pbatch {
+                    let k = paired.sample(&mut rng);
+                    let rec = paired.recs[k];
+                    let mut a = frames.stack_f32(rec, 0);
+                    aug::aug_stack_expr(&mut a, &mut rng, &mut scratch);
+                    let mut b = frames.stack_f32(rec, 1);
+                    aug::aug_stack_expr(&mut b, &mut rng, &mut scratch);
+                    pl.extend_from_slice(&a);
+                    pr.extend_from_slice(&b);
+                    pll.extend_from_slice(&paired.ll[k]);
+                    prl.extend_from_slice(&paired.rl[k]);
+                }
+                if tx.send((pl, pr, pll, prl)).is_err() {
+                    break;
+                }
+            }
+        });
+    }
+    rx
 }
 
 pub fn build_samples(bin: &Bin, frames: &Frames) -> Vec<Sample> {
@@ -370,6 +447,16 @@ pub fn fit_expr_staged<B: AutodiffBackend>(
     let pools = Arc::new(Pools::expr_build(&samples, train));
     let rx = spawn_prefetch(frames.clone(), samples.clone(), w, cfg.batch, cfg.workers, true, 0xE47, pools);
 
+    // Paired-eye stream for evenness (both stages) + consensus (stage B). pbatch = batch/2 (reference
+    // EXPR_EVEN_BATCH). Falls back to expr-only if the capture has no records with both eyes valid.
+    let paired = Arc::new(Paired::build(&samples, train));
+    let do_paired = !paired.is_empty();
+    let pbatch = (cfg.batch / 2).max(1);
+    let prx = do_paired.then(|| {
+        spawn_paired_prefetch(frames.clone(), paired.clone(), pbatch, cfg.workers, 0x9A17)
+    });
+    let cons_ckpt = ckpt.replace("expr", "cons");
+
     let mut model = Mnv4::<B>::new(T, 4, device);
     if load_pretrained_expr(&mut model) {
         model.small_init_head(device); // reference re-inits the head small after loading the backbone
@@ -377,6 +464,9 @@ pub fn fit_expr_staged<B: AutodiffBackend>(
     let head_ids = model.head_ids();
     let mut opt_head = AdamWConfig::new().with_weight_decay(cfg.wd).init();
     let mut opt_bb = AdamWConfig::new().with_weight_decay(cfg.wd).init();
+    // Consensus heads (feat_dim = classifier input = 1280); trained in stage B on detached teacher feats.
+    let mut cons = ConsensusHeads::<B>::new(1280, device);
+    let mut opt_cons = AdamWConfig::new().with_weight_decay(cfg.wd).init();
 
     let mut teacher = model.valid();
     let mut best = f32::INFINITY;
@@ -406,13 +496,46 @@ pub fn fit_expr_staged<B: AutodiffBackend>(
         let (xs, ys) = rx.recv().unwrap();
         let x = Tensor::<B, 4>::from_data(TensorData::new(xs, [cfg.batch, T, S, S]), device);
         let y = Tensor::<B, 2>::from_data(TensorData::new(ys, [cfg.batch, 4]), device);
-        let loss = supervised_deconfuse(model.forward(x), y, device);
+        let mut loss = supervised_deconfuse(model.forward(x), y, device);
+
+        // Paired-eye terms. Evenness (agree-gated L/R symmetry on the student) runs in both stages;
+        // consensus (two-eye head on detached teacher features, target = mean of L/R labels) in stage B.
+        let mut cons_step = false;
+        if let Some(prx) = &prx {
+            let (pld, prd, plld, prld) = prx.recv().unwrap();
+            let pl_x = Tensor::<B, 4>::from_data(TensorData::new(pld.clone(), [pbatch, T, S, S]), device);
+            let pr_x = Tensor::<B, 4>::from_data(TensorData::new(prd.clone(), [pbatch, T, S, S]), device);
+            let pll = Tensor::<B, 2>::from_data(TensorData::new(plld, [pbatch, 4]), device);
+            let prl = Tensor::<B, 2>::from_data(TensorData::new(prld, [pbatch, 4]), device);
+            let out_pl = model.forward(pl_x);
+            let out_pr = model.forward(pr_x);
+            loss = loss + evenness(out_pl, out_pr, pll.clone(), prl.clone(), device);
+            if stage_b {
+                // detached teacher features (matches deployment, where consensus runs on the exported
+                // teacher); autodiff grads flow only into the consensus heads.
+                let pl_i = Tensor::<B::InnerBackend, 4>::from_data(TensorData::new(pld, [pbatch, T, S, S]), device);
+                let pr_i = Tensor::<B::InnerBackend, 4>::from_data(TensorData::new(prd, [pbatch, T, S, S]), device);
+                let fl = Tensor::<B, 2>::from_data(teacher.forward_features(pl_i).into_data(), device);
+                let fr = Tensor::<B, 2>::from_data(teacher.forward_features(pr_i).into_data(), device);
+                let tgt = (pll + prl).mul_scalar(0.5);
+                let g0 = tgt.clone().slice([0..pbatch, 1..3]); // widen, squint
+                let g1 = tgt.slice([0..pbatch, 3..4]); // brow
+                loss = loss + consensus_term(cons.forward(0, fl.clone(), fr.clone()), g0);
+                loss = loss + consensus_term(cons.forward(1, fl, fr), g1);
+                cons_step = true;
+            }
+        }
+
         let mut grads = loss.backward();
         let head_gp = GradientsParams::from_params(&mut grads, &model, &head_ids);
         let bb_gp = GradientsParams::from_module(&mut grads, &model); // remaining = backbone
         model = opt_head.step(lr_head, model, head_gp);
         if !frozen {
             model = opt_bb.step(lr_bb, model, bb_gp);
+        }
+        if cons_step {
+            let cons_gp = GradientsParams::from_module(&mut grads, &cons);
+            cons = opt_cons.step(lr_head, cons, cons_gp);
         }
 
         if step % ema_every == 0 {
@@ -433,7 +556,11 @@ pub fn fit_expr_staged<B: AutodiffBackend>(
             println!("[expr {st} {step:5}/{}] mse={mse:.5} r({:.3} {:.3} {:.3} {:.3}) {tag}", cfg.steps, r[0], r[1], r[2], r[3]);
             if mse < best {
                 best = mse;
-                teacher.clone().save_file(ckpt, &NamedMpkFileRecorder::<FullPrecisionSettings>::new()).unwrap();
+                let rec = NamedMpkFileRecorder::<FullPrecisionSettings>::new();
+                teacher.clone().save_file(ckpt, &rec).unwrap();
+                if stage_b && do_paired {
+                    cons.clone().save_file(&cons_ckpt, &rec).unwrap();
+                }
             }
         }
     }

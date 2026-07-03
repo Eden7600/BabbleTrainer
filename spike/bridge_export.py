@@ -11,7 +11,7 @@ import torch
 from safetensors.torch import load_file
 
 import config as C
-from model_dual import build_expr_net, build_gaze_net
+from model_dual import build_expr_net, build_gaze_net, build_consensus_heads, expr_feat_dim
 from export_dual_onnx import export
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -34,12 +34,25 @@ def load_into(net, st_path, tag):
     return net
 
 
+CONS_ST = os.path.join(HERE, "cons_pt.safetensors")
+
+
 def main():
     expr = load_into(build_expr_net(pretrained=False), EXPR_ST, "expr")
     gaze = load_into(build_gaze_net(), GAZE_ST, "gaze")
     expr_sd = {k: v.cpu() for k, v in expr.state_dict().items()}
     gaze_sd = {k: v.cpu() for k, v in gaze.state_dict().items()}
-    torch.save({"teacher": expr_sd, "student": expr_sd, "backbone": C.BACKBONE, "step": 0}, EXPR_PT)
+    ckpt = {"teacher": expr_sd, "student": expr_sd, "backbone": C.BACKBONE, "step": 0}
+
+    # Attach the consensus heads (if trained) so export_dual_onnx emits the 15-dim brow-fused output.
+    if os.path.exists(CONS_ST) and C.DUAL_CONSENSUS_HEAD:
+        heads = build_consensus_heads(expr_feat_dim(expr))
+        csd = load_file(CONS_ST)
+        missing, unexpected = heads.load_state_dict(csd, strict=False)
+        print(f"[cons] loaded {len(csd)} tensors | missing={len(missing)} unexpected={len(unexpected)}")
+        ckpt["consensus"] = {k: v.cpu() for k, v in heads.state_dict().items()}
+
+    torch.save(ckpt, EXPR_PT)
     torch.save({"gaze": gaze_sd, "step": 0, "arch": "microchad"}, GAZE_PT)
     print(f"wrote {EXPR_PT} + {GAZE_PT}")
     export(GAZE_PT, EXPR_PT, OUT_ONNX, check=False)
