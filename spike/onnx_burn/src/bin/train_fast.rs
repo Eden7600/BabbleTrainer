@@ -74,15 +74,22 @@ fn main() {
     println!("{} eye-samples", samples.len());
     let (train, val) = split(samples.len(), 0.1, 1234);
 
+    // Gaze runs CONCURRENTLY with expr: expr is host-dispatch-bound, gaze is GPU-kernel-bound, so the
+    // two streams interleave on one device and gaze's wall hides under expr's.
+    let (frames_g, samples_g, train_g, val_g) = (frames.clone(), samples.clone(), train.clone(), val.clone());
+    let gaze_h = std::thread::spawn(move || {
+        let device = Default::default();
+        fit_gaze_fast::<AB>(
+            frames_g, samples_g, &train_g, &val_g,
+            &FastCfg { steps: gs, batch: 64, warmup: gs / 10, val_every: (gs / 4).max(1), lr: 1e-3, wd: 1e-2, workers: 2 },
+            &device, "../ckpt_gaze.mpk",
+        )
+    });
     let e = fit_expr_staged::<AB>(
-        frames.clone(), samples.clone(), &train, &val,
+        frames, samples, &train, &val,
         &FastCfg { steps: es, batch: 32, warmup: es / 10, val_every: (es / 4).max(1), lr: 5e-4, wd: 1e-4, workers },
         &device, "../ckpt_expr.mpk",
     );
-    let g = fit_gaze_fast::<AB>(
-        frames, samples, &train, &val,
-        &FastCfg { steps: gs, batch: 64, warmup: gs / 10, val_every: (gs / 4).max(1), lr: 1e-3, wd: 1e-2, workers },
-        &device, "../ckpt_gaze.mpk",
-    );
+    let g = gaze_h.join().unwrap();
     println!("\nBEST expr mse={e:.5} | BEST gaze mae={g:.2}deg");
 }

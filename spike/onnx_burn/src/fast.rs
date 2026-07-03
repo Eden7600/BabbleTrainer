@@ -598,30 +598,48 @@ pub fn fit_expr_staged<B: AutodiffBackend>(
 
         let t0 = Instant::now();
         let y = Tensor::<B, 2>::from_data(TensorData::new(ys, [cfg.batch, 4]), device);
-        let big = Tensor::<B, 4>::from_data(TensorData::new(sdata, [rows, T, S, S]), device);
+        // Upload the mega-batch ONCE as an inner (non-autodiff) tensor; the student consumes it via
+        // from_inner (inputs need no grad) and the teacher slices it directly — no duplicate h2d.
+        let big_i = Tensor::<B::InnerBackend, 4>::from_data(TensorData::new(sdata, [rows, T, S, S]), device);
         pt[1] += t0.elapsed().as_secs_f32();
 
         let t0 = Instant::now();
-        let out = model.forward(big);
+        let out = model.forward(Tensor::from_inner(big_i.clone()));
         let mut loss = supervised_deconfuse(out.clone().slice([0..cfg.batch]), y, device);
         pt[2] += t0.elapsed().as_secs_f32();
         let t0 = Instant::now();
 
+        // ONE folded teacher inference pass over every row that needs teacher features (pl, pr, cw),
+        // kept on-device: from_inner lifts the results into autodiff as constant leaves (detached),
+        // so grads still flow only into the consensus heads / student — no host readback.
+        let need_pair_feats = stage_b && paired_b.is_some();
+        let tfeats = if need_pair_feats || unlab_b.is_some() {
+            let mut segs: Vec<Tensor<B::InnerBackend, 4>> = Vec::with_capacity(3);
+            if need_pair_feats {
+                segs.push(big_i.clone().slice([off_pl..off_pl + pbatch]));
+                segs.push(big_i.clone().slice([off_pr..off_pr + pbatch]));
+            }
+            if unlab_b.is_some() {
+                segs.push(big_i.clone().slice([off_cw..off_cw + ub]));
+            }
+            Some(teacher.forward_features(Tensor::cat(segs, 0)))
+        } else {
+            None
+        };
+        let cw_base = if need_pair_feats { 2 * pbatch } else { 0 };
+
         // Evenness (both stages) + consensus (stage B) on the paired eyes.
         let mut cons_step = false;
-        if let Some((pld, prd, plld, prld)) = &paired_b {
+        if let Some((_, _, plld, prld)) = &paired_b {
             let out_pl = out.clone().slice([off_pl..off_pl + pbatch]);
             let out_pr = out.clone().slice([off_pr..off_pr + pbatch]);
             let pll = Tensor::<B, 2>::from_data(TensorData::new(plld.clone(), [pbatch, 4]), device);
             let prl = Tensor::<B, 2>::from_data(TensorData::new(prld.clone(), [pbatch, 4]), device);
             loss = loss + evenness(out_pl, out_pr, pll.clone(), prl.clone(), device);
             if stage_b {
-                // detached teacher features (matches deployment, where consensus runs on the exported
-                // teacher); autodiff grads flow only into the consensus heads.
-                let pl_i = Tensor::<B::InnerBackend, 4>::from_data(TensorData::new(pld.clone(), [pbatch, T, S, S]), device);
-                let pr_i = Tensor::<B::InnerBackend, 4>::from_data(TensorData::new(prd.clone(), [pbatch, T, S, S]), device);
-                let fl = Tensor::<B, 2>::from_data(teacher.forward_features(pl_i).into_data(), device);
-                let fr = Tensor::<B, 2>::from_data(teacher.forward_features(pr_i).into_data(), device);
+                let tf = tfeats.as_ref().unwrap();
+                let fl = Tensor::from_inner(tf.clone().slice([0..pbatch]));
+                let fr = Tensor::from_inner(tf.clone().slice([pbatch..2 * pbatch]));
                 let tgt = (pll + prl).mul_scalar(0.5);
                 let g0 = tgt.clone().slice([0..pbatch, 1..3]); // widen, squint
                 let g1 = tgt.slice([0..pbatch, 3..4]); // brow
@@ -633,12 +651,12 @@ pub fn fit_expr_staged<B: AutodiffBackend>(
 
         // Mean-teacher (strong<->weak consistency, quadratic ramp) + temporal smoothness (adjacent
         // frames within margin), stage B, on the unlabeled in-domain stream.
-        if let Some((_, cw, _, ok)) = &unlab_b {
+        if let Some((_, _, _, ok)) = &unlab_b {
             let cs_out = out.clone().slice([off_cs..off_cs + ub]);
             let cw_out = out.clone().slice([off_cw..off_cw + ub]);
             let nw_out = out.clone().slice([off_nw..off_nw + ub]);
-            let cw_i = Tensor::<B::InnerBackend, 4>::from_data(TensorData::new(cw.clone(), [ub, T, S, S]), device);
-            let t_out = Tensor::<B, 2>::from_data(teacher.classify(teacher.forward_features(cw_i)).into_data(), device);
+            let cw_f = tfeats.as_ref().unwrap().clone().slice([cw_base..cw_base + ub]);
+            let t_out = Tensor::from_inner(teacher.classify(cw_f));
             let rampup = (b_steps / 4).max(1) as f64;
             let lam = (((step - a_steps) as f64 / rampup).min(1.0).powi(2)) as f32; // lambda_cons = 1.0
             loss = loss + mt_consistency(cs_out, t_out).mul_scalar(lam);
