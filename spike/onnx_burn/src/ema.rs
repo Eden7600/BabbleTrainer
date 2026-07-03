@@ -1,8 +1,13 @@
-// Exponential-moving-average "teacher": a smoothed copy of the model updated toward the student every
-// few steps. BatchNorm running stats flow through map_float exactly like learnable params, so a single
-// pass averages the full state (matching BabbleTrainer's EMATeacher). The teacher is on the inner
-// (non-autodiff) backend, so blending builds no autograd graph; it is what gets evaluated + exported,
-// and later drives the Mean-Teacher consistency loss. All on-device (no host sync).
+// Exponential-moving-average "teacher": a smoothed copy of the model. Learnable params are decayed
+// toward the student (teacher <- keep*teacher + (1-keep)*student); BatchNorm running stats are COPIED
+// from the student, NOT decayed — matching BabbleTrainer's EMATeacher, which decays parameters but
+// `torch._foreach_copy_`s buffers (model.py). Copying matters: the teacher runs BN in inference mode
+// (ad disabled), so it never updates its own running stats — decaying them would make the deployed
+// teacher normalize with stats that lag the student by a second EMA. `copy` holds the running-stat
+// ParamIds (from Mnv4::running_state_ids). The teacher is on the inner (non-autodiff) backend, so this
+// builds no autograd graph; it is what gets evaluated + exported and drives the Mean-Teacher loss.
+use std::collections::HashSet;
+
 use burn::module::{Module, ModuleMapper, ModuleVisitor, Param, ParamId};
 use burn::optim::GradientsParams;
 use burn::tensor::{backend::Backend, Tensor};
@@ -16,26 +21,29 @@ impl<B: Backend> ModuleVisitor<B> for Collect {
     }
 }
 
-struct Blend {
+struct Blend<'a> {
     store: GradientsParams,
-    keep: f32, // teacher weight; student weight = 1-keep
+    keep: f32, // teacher weight; student weight = 1-keep (learnable params only)
+    copy: &'a HashSet<ParamId>, // BN running-stat ids: take the student value verbatim
 }
-impl<B: Backend> ModuleMapper<B> for Blend {
+impl<B: Backend> ModuleMapper<B> for Blend<'_> {
     fn map_float<const D: usize>(&mut self, p: Param<Tensor<B, D>>) -> Param<Tensor<B, D>> {
         let id: ParamId = p.id;
         let t = p.val();
         match self.store.get::<B, D>(id) {
+            Some(s) if self.copy.contains(&id) => Param::initialized(id, s), // buffer copy
             Some(s) => Param::initialized(id, t.mul_scalar(self.keep) + s.mul_scalar(1.0 - self.keep)),
             None => Param::initialized(id, t),
         }
     }
 }
 
-// teacher <- keep*teacher + (1-keep)*student, over every param + BN buffer. Both modules on backend B
-// (the inner/non-autodiff backend). ParamIds are stable across optimizer steps + valid(), so the
-// lookup matches by identity, not traversal order.
-pub fn ema_update<B: Backend, M: Module<B>>(teacher: M, student: &M, keep: f32) -> M {
+// ParamIds are stable across optimizer steps + valid(), so the lookup matches by identity, not
+// traversal order. `copy` = the BN running-stat ids to hard-copy from the student.
+pub fn ema_update<B: Backend, M: Module<B>>(
+    teacher: M, student: &M, keep: f32, copy: &HashSet<ParamId>,
+) -> M {
     let mut c = Collect { store: GradientsParams::new() };
     student.visit(&mut c);
-    teacher.map(&mut Blend { store: c.store, keep })
+    teacher.map(&mut Blend { store: c.store, keep, copy })
 }

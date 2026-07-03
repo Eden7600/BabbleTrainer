@@ -2,15 +2,38 @@
 // Param paths mirror timm keys so the timm<->Burn map is mechanical (PyTorchToBurnAdapter handles
 // weight->gamma/beta + Linear transpose). Blueprint: spike/blocks_structure.txt / weight_keys.txt.
 
-use burn::module::{Ignored, Module};
+use burn::module::{Ignored, Module, ParamId};
 use burn::nn::conv::{Conv2d, Conv2dConfig};
 use burn::nn::pool::{AdaptiveAvgPool2d, AdaptiveAvgPool2dConfig};
 use burn::nn::{BatchNorm, BatchNormConfig, Linear, LinearConfig, PaddingConfig2d};
 use burn::prelude::*;
 use burn::tensor::activation::relu;
+use burn::tensor::Distribution;
 
 fn bn<B: Backend>(c: usize, dev: &B::Device) -> BatchNorm<B> {
     BatchNormConfig::new(c).with_epsilon(1e-5).with_momentum(0.1).init(dev)
+}
+
+// timm drop_rate=0.2 / torchvision Dropout(0.2): applied to the pooled features right before the
+// classifier (model_dual.py _build_expr_tower). Active only under autodiff (the student, mid-train);
+// the EMA teacher + eval run on the inner backend where ad is disabled, so it is a no-op there —
+// matching PyTorch train()/eval() dropout without a train/eval flag. Inverted (scale-on-keep) dropout,
+// identical to burn's nn::Dropout but inlined so no module-record field is added (checkpoint-compatible).
+const EXPR_HEAD_DROP: f64 = 0.2;
+fn head_dropout<B: Backend>(x: Tensor<B, 2>) -> Tensor<B, 2> {
+    if !B::ad_enabled(&x.device()) || EXPR_HEAD_DROP == 0.0 {
+        return x;
+    }
+    let keep = 1.0 - EXPR_HEAD_DROP;
+    let mask = x.random_like(Distribution::Bernoulli(keep));
+    (x * mask).mul_scalar(1.0 / keep)
+}
+
+// BN running_mean/running_var ParamIds. The EMA teacher must COPY these from the student (Python's
+// EMATeacher decays params but `_foreach_copy_`s buffers), so the blend special-cases them.
+fn bn_running_ids<B: Backend>(bn: &BatchNorm<B>, out: &mut Vec<ParamId>) {
+    out.push(bn.running_mean.clone().into_record().id);
+    out.push(bn.running_var.clone().into_record().id);
 }
 
 fn conv2d<B: Backend>(cin: usize, cout: usize, k: usize, stride: usize, groups: usize, dev: &B::Device) -> Conv2d<B> {
@@ -88,6 +111,13 @@ impl<B: Backend> Block<B> {
         }
         if *self.residual { h + inp } else { h }
     }
+
+    fn collect_bn_ids(&self, out: &mut Vec<ParamId>) {
+        if let Some(bn) = &self.bn1 { bn_running_ids(bn, out); }
+        for cb in [&self.dw_start, &self.pw_exp, &self.dw_mid, &self.pw_proj] {
+            if let Some(cb) = cb { bn_running_ids(&cb.bn, out); }
+        }
+    }
 }
 
 #[derive(Module, Debug)]
@@ -156,7 +186,21 @@ impl<B: Backend> Mnv4<B> {
     }
 
     pub fn forward(&self, x: Tensor<B, 4>) -> Tensor<B, 2> {
-        self.classifier.forward(self.forward_features(x))
+        self.classifier.forward(head_dropout(self.forward_features(x)))
+    }
+
+    // BN running-stat ParamIds across every BatchNorm in the net (stem, all blocks, head). The EMA
+    // teacher copies these from the student rather than decaying them (Python EMATeacher buffer copy).
+    pub fn running_state_ids(&self) -> Vec<ParamId> {
+        let mut ids = Vec::new();
+        bn_running_ids(&self.bn1, &mut ids);
+        for stage in &self.blocks {
+            for blk in stage {
+                blk.collect_bn_ids(&mut ids);
+            }
+        }
+        bn_running_ids(&self.norm_head, &mut ids);
+        ids
     }
 
     // Head applied to precomputed features (lets the teacher reuse one forward_features pass).

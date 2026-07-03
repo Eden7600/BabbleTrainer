@@ -1,11 +1,13 @@
 // Fast data path: rayon-parallel decode up front + background-prefetch batchers so the GPU stays fed
 // (batch size unchanged — larger batches hurt expression quality, an optimization-dynamics effect).
+use std::collections::HashSet;
 use std::sync::mpsc::{sync_channel, Receiver};
 use std::sync::Arc;
 use std::thread;
 use std::time::Instant;
 
 use burn::module::AutodiffModule;
+use burn::module::ParamId;
 use burn::optim::{AdamWConfig, GradientsParams, Optimizer};
 use burn::prelude::*;
 use burn::record::{FullPrecisionSettings, NamedMpkFileRecorder};
@@ -401,7 +403,10 @@ fn eval_expr<BI: Backend>(model: &Mnv4<BI>, frames: &Frames, samples: &[Sample],
     (mse, r)
 }
 
-fn eval_gaze<BI: Backend>(model: &MicroChad<BI>, frames: &Frames, samples: &[Sample], val: &[usize], device: &BI::Device) -> (f32, [f32; 2]) {
+// Returns (val MSE in normalized [0,1] space, MAE in degrees, per-channel Pearson r). Best-checkpoint
+// selection is on MSE to match BabbleTrainer (evaluate_gaze selects on `((p-t)**2).mean()`); MAE(deg)
+// is reported for readability but not used for selection.
+fn eval_gaze<BI: Backend>(model: &MicroChad<BI>, frames: &Frames, samples: &[Sample], val: &[usize], device: &BI::Device) -> (f32, f32, [f32; 2]) {
     let sel: Vec<usize> = val.iter().cloned().filter(|&i| samples[i].gaze_usable).collect();
     let sel = if sel.is_empty() { val.to_vec() } else { sel };
     let (mut preds, mut tgts) = (Vec::new(), Vec::new());
@@ -411,14 +416,16 @@ fn eval_gaze<BI: Backend>(model: &MicroChad<BI>, frames: &Frames, samples: &[Sam
         preds.extend(model.forward(x).into_data().to_vec::<f32>().unwrap());
         tgts.extend(ys);
     }
-    let mae = preds.iter().zip(&tgts).map(|(a, b)| (a - b).abs()).sum::<f32>() / preds.len() as f32 * 90.0;
+    let n = preds.len() as f32;
+    let mse = preds.iter().zip(&tgts).map(|(a, b)| (a - b).powi(2)).sum::<f32>() / n;
+    let mae = preds.iter().zip(&tgts).map(|(a, b)| (a - b).abs()).sum::<f32>() / n * 90.0;
     let mut r = [0.0; 2];
     for c in 0..2 {
         let pc: Vec<f32> = preds.iter().skip(c).step_by(2).cloned().collect();
         let tc: Vec<f32> = tgts.iter().skip(c).step_by(2).cloned().collect();
         r[c] = pearson(&pc, &tc);
     }
-    (mae, r)
+    (mse, mae, r)
 }
 
 pub fn fit_expr_fast<B: AutodiffBackend>(
@@ -430,6 +437,7 @@ pub fn fit_expr_fast<B: AutodiffBackend>(
     let rx = spawn_prefetch(frames.clone(), samples.clone(), w, cfg.batch, cfg.workers, true, 0xE47, pools);
     let mut model = Mnv4::<B>::new(T, 4, device);
     load_pretrained_expr(&mut model);
+    let bn_ids: HashSet<ParamId> = model.running_state_ids().into_iter().collect();
     let mut opt = AdamWConfig::new().with_weight_decay(cfg.wd).init();
     let mut teacher = model.valid(); // EMA teacher (what we deploy/export), matches BabbleTrainer
     let ema_every = 16usize;
@@ -454,7 +462,7 @@ pub fn fit_expr_fast<B: AutodiffBackend>(
         let gp = GradientsParams::from_grads(loss.backward(), &model);
         model = opt.step(cos_lr(step, cfg.steps, cfg.warmup, cfg.lr), model, gp);
         if step % ema_every == 0 {
-            teacher = ema_update::<B::InnerBackend, _>(teacher, &model.valid(), keep);
+            teacher = ema_update::<B::InnerBackend, _>(teacher, &model.valid(), keep, &bn_ids);
         }
         if step % 100 == 99 {
             let dt = win.elapsed().as_secs_f32();
@@ -468,7 +476,7 @@ pub fn fit_expr_fast<B: AutodiffBackend>(
             win = Instant::now();
         }
         if step % cfg.val_every == 0 || step == cfg.steps - 1 {
-            teacher = ema_update::<B::InnerBackend, _>(teacher, &model.valid(), keep); // fold latest steps
+            teacher = ema_update::<B::InnerBackend, _>(teacher, &model.valid(), keep, &bn_ids); // fold latest steps
             let (mse, r) = eval_expr(&teacher, &frames, &samples, val, device);
             let tag = if mse < best { "*" } else { "" };
             println!("[expr {step:5}/{}] mse={mse:.5} r({:.3} {:.3} {:.3} {:.3}) {tag}", cfg.steps, r[0], r[1], r[2], r[3]);
@@ -528,6 +536,7 @@ pub fn fit_expr_staged<B: AutodiffBackend>(
         model.small_init_head(device); // reference re-inits the head small after loading the backbone
     }
     let head_ids = model.head_ids();
+    let bn_ids: HashSet<ParamId> = model.running_state_ids().into_iter().collect();
     let mut opt_head = AdamWConfig::new().with_weight_decay(cfg.wd).init();
     let mut opt_bb = AdamWConfig::new().with_weight_decay(cfg.wd).init();
     // Consensus heads (feat_dim = classifier input = 1280); trained in stage B on detached teacher feats.
@@ -694,7 +703,7 @@ pub fn fit_expr_staged<B: AutodiffBackend>(
         let t0 = Instant::now();
         if step % ema_every == 0 {
             let keep = decay.powi(ema_every as i32) as f32;
-            teacher = ema_update::<B::InnerBackend, _>(teacher, &model.valid(), keep);
+            teacher = ema_update::<B::InnerBackend, _>(teacher, &model.valid(), keep, &bn_ids);
         }
         psync(micro);
         pt[6] += t0.elapsed().as_secs_f32();
@@ -715,7 +724,7 @@ pub fn fit_expr_staged<B: AutodiffBackend>(
         }
         if step % cfg.val_every == 0 || step == cfg.steps - 1 {
             let keep = decay.powi(ema_every as i32) as f32;
-            teacher = ema_update::<B::InnerBackend, _>(teacher, &model.valid(), keep);
+            teacher = ema_update::<B::InnerBackend, _>(teacher, &model.valid(), keep, &bn_ids);
             let (mse, r) = eval_expr(&teacher, &frames, &samples, val, device);
             let tag = if mse < best { "*" } else { "" };
             let st = if stage_b { "B" } else { "A" };
@@ -742,7 +751,8 @@ pub fn fit_gaze_fast<B: AutodiffBackend>(
     let rx = spawn_prefetch(frames.clone(), samples.clone(), w, cfg.batch, cfg.workers, false, 0x6A2E, pools);
     let mut model = MicroChad::<B>::new(T, 2, device);
     let mut opt = AdamWConfig::new().with_weight_decay(cfg.wd).init();
-    let mut best = f32::INFINITY;
+    let mut best = f32::INFINITY; // best val MSE (selection metric, matches BabbleTrainer)
+    let mut best_mae = f32::INFINITY; // MAE(deg) at the best-MSE checkpoint (for the summary line)
     let mut win = Instant::now();
     // Gaze deploys the STUDENT (BabbleTrainer only uses a gaze EMA teacher under semi-supervised
     // mean-teacher, wired separately).
@@ -786,14 +796,15 @@ pub fn fit_gaze_fast<B: AutodiffBackend>(
         }
         if step % cfg.val_every == 0 || step == cfg.steps - 1 {
             let vm = model.valid();
-            let (mae, r) = eval_gaze(&vm, &frames, &samples, val, device);
-            let tag = if mae < best { "*" } else { "" };
-            println!("[gaze {step:5}/{}] mae={mae:.2}deg r({:.3},{:.3}) {tag}", cfg.steps, r[0], r[1]);
-            if mae < best {
-                best = mae;
+            let (mse, mae, r) = eval_gaze(&vm, &frames, &samples, val, device);
+            let tag = if mse < best { "*" } else { "" };
+            println!("[gaze {step:5}/{}] mse={mse:.5} mae={mae:.2}deg r({:.3},{:.3}) {tag}", cfg.steps, r[0], r[1]);
+            if mse < best {
+                best = mse;
+                best_mae = mae;
                 vm.clone().save_file(ckpt, &NamedMpkFileRecorder::<FullPrecisionSettings>::new()).unwrap();
             }
         }
     }
-    best
+    best_mae
 }
