@@ -8,7 +8,7 @@ use burn::tensor::backend::AutodiffBackend;
 use crate::data::{temporal_stack, Bin, EyeCache, Sample, S, T};
 use crate::eval::{eval_expr, eval_gaze};
 use crate::gaze::MicroChad;
-use crate::losses::{supervised, supervised_deconfuse};
+use crate::losses::{supervised, supervised_deconfuse, ExprConsts};
 use crate::mnv4::Mnv4;
 use crate::sampler::{gaze_weights, split, Rng, Weighted};
 
@@ -61,14 +61,15 @@ pub fn fit_supervised<B: AutodiffBackend>(
         let idxs: Vec<usize> = (0..batch).map(|_| rng.next_usize(n)).collect();
         let (x, y) = make_batch::<B>(bin, samples, &idxs, &cache, device);
         let loss = supervised(model.forward(x), y);
-        let val = loss.clone().into_scalar().elem::<f32>();
+        let printing = step % 5 == 0 || step == steps - 1; // only sync the loss scalar when we print it
+        let val = if printing { loss.clone().into_scalar().elem::<f32>() } else { 0.0 };
         if step == 0 {
             first = val;
         }
         let grads = loss.backward();
         let gp = GradientsParams::from_grads(grads, &model);
         model = opt.step(lr, model, gp);
-        if step % 5 == 0 || step == steps - 1 {
+        if printing {
             println!("step {step:4} loss {val:.5}");
         }
     }
@@ -115,11 +116,12 @@ pub fn fit_expr<B: AutodiffBackend>(
     let cache = EyeCache::default();
     let mut rng = Rng::new(0xE47);
     let mut best = f32::INFINITY;
+    let lc = ExprConsts::<B>::new(device); // hoisted loss constants (built once, not per step)
     for step in 0..cfg.steps {
         let lr = cos_lr(step, cfg.steps, cfg.warmup, cfg.lr);
         let idxs: Vec<usize> = (0..cfg.batch).map(|_| w.sample(&mut rng)).collect();
         let (x, y) = make_batch::<B>(bin, samples, &idxs, &cache, device);
-        let loss = supervised_deconfuse(model.forward(x), y, device);
+        let loss = supervised_deconfuse(model.forward(x), y, &lc.deconf);
         let grads = loss.backward();
         let gp = GradientsParams::from_grads(grads, &model);
         model = opt.step(lr, model, gp);
@@ -158,7 +160,8 @@ pub fn fit_gaze<B: AutodiffBackend>(
     let mut opt = AdamWConfig::new().with_weight_decay(cfg.wd).init();
     let cache = EyeCache::default();
     let mut rng = Rng::new(0x6A2E);
-    let mut best = f32::INFINITY;
+    let mut best = f32::INFINITY; // best val MSE (selection metric, matches fit_gaze_fast)
+    let mut best_mae = f32::INFINITY; // MAE(deg) at the best-MSE checkpoint (return value)
     for step in 0..cfg.steps {
         let lr = cos_lr(step, cfg.steps, cfg.warmup, cfg.lr);
         let idxs: Vec<usize> = (0..cfg.batch).map(|_| w.sample(&mut rng)).collect();
@@ -180,17 +183,14 @@ pub fn fit_gaze<B: AutodiffBackend>(
         if step % cfg.val_every == 0 || step == cfg.steps - 1 {
             let vm = model.valid();
             let (mse, mae, r) = eval_gaze(&vm, bin, samples, &val_idx, &cache, device);
-            let tag = if mse_better(mae, best) { "*" } else { "" };
+            let tag = if mse < best { "*" } else { "" };
             println!("[gaze {step:5}/{}] mse={mse:.5} mae={mae:.2}deg r({:.3},{:.3}) {tag}", cfg.steps, r[0], r[1]);
-            if mse_better(mae, best) {
-                best = mae;
+            if mse < best {
+                best = mse;
+                best_mae = mae;
                 save_gaze(&vm, ckpt);
             }
         }
     }
-    best
-}
-
-fn mse_better(v: f32, best: f32) -> bool {
-    v < best
+    best_mae
 }

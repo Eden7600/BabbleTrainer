@@ -8,7 +8,6 @@ burn = { version = "0.21.0", features = ["autodiff", "ndarray", "wgpu", "vulkan"
 burn-store = "0.21.0"
 image = { version = "0.25.10", default-features = false, features = ["jpeg"] }
 npyz = { version = "0.9.1", features = ["npz"] }
-rand = "0.10.1"
 rayon = "1.12.0"
 
 [build-dependencies]

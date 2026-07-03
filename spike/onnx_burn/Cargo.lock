@@ -4697,7 +4697,6 @@ dependencies = [
  "burn-store",
  "image",
  "npyz",
- "rand 0.10.1",
  "rayon",
 ]
 

@@ -20,7 +20,7 @@ use crate::data::{process_eye, Bin, Sample, S, T};
 use crate::ema::ema_update;
 use crate::gaze::MicroChad;
 use crate::heads::ConsensusHeads;
-use crate::losses::{consensus_term, evenness, mt_consistency, supervised_deconfuse, temporal};
+use crate::losses::{consensus_term, evenness, mt_consistency, supervised_deconfuse, temporal, ExprConsts};
 use crate::mnv4::Mnv4;
 use crate::sampler::{gaze_weights, Rng, Weighted};
 
@@ -146,11 +146,12 @@ impl Unlabeled {
 type UnlabBatch = (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>); // cur_strong, cur_weak, nbr_weak, pair_ok
 
 fn spawn_unlabeled_prefetch(
-    frames: Arc<Frames>, unlab: Arc<Unlabeled>, ub: usize, workers: usize, seed: u64,
+    frames: Arc<Frames>, unlab: Arc<Unlabeled>, present: Arc<HashSet<(usize, usize)>>, ub: usize,
+    workers: usize, seed: u64,
 ) -> Receiver<UnlabBatch> {
     let (tx, rx) = sync_channel::<UnlabBatch>(workers * 2);
     for wi in 0..workers.max(1) {
-        let (frames, unlab, tx) = (frames.clone(), unlab.clone(), tx.clone());
+        let (frames, unlab, present, tx) = (frames.clone(), unlab.clone(), present.clone(), tx.clone());
         thread::spawn(move || {
             let mut rng = Rng::new(seed.wrapping_add((wi as u64).wrapping_mul(0x85EBCA77)));
             let mut scratch = Vec::new();
@@ -163,8 +164,12 @@ fn spawn_unlabeled_prefetch(
                     let g = aug::sample_geom_weak(&mut rng); // shared geom for cur/nbr weak views
                     let mut b = frames.stack_f32(rec, side);
                     aug::aug_stack_weak(&mut b, &g, &mut rng);
-                    let pair_ok = if rec >= 1 { 1.0 } else { 0.0 };
-                    let mut c = frames.stack_f32(if rec >= 1 { rec - 1 } else { rec }, side);
+                    // Only pair with the previous frame if it is a real GOOD, decoded same-side frame
+                    // (present in the sample set). Otherwise the temporal hinge would train against a
+                    // blank / non-good neighbor; mask it out (pair_ok=0, self as placeholder).
+                    let has_nbr = rec >= 1 && present.contains(&(rec - 1, side));
+                    let pair_ok = if has_nbr { 1.0 } else { 0.0 };
+                    let mut c = frames.stack_f32(if has_nbr { rec - 1 } else { rec }, side);
                     aug::aug_stack_weak(&mut c, &g, &mut rng);
                     cs.extend_from_slice(&a);
                     cw.extend_from_slice(&b);
@@ -428,65 +433,42 @@ fn eval_gaze<BI: Backend>(model: &MicroChad<BI>, frames: &Frames, samples: &[Sam
     (mse, mae, r)
 }
 
-pub fn fit_expr_fast<B: AutodiffBackend>(
-    frames: Arc<Frames>, samples: Arc<Vec<Sample>>, train: &[usize], val: &[usize], cfg: &FastCfg,
-    device: &B::Device, ckpt: &str,
+// Consensus-head val metric: MSE of the DEPLOYED fused outputs (widen/squint/brow) on paired val
+// records, so best-checkpoint selection can prefer a step where the consensus is actually trained.
+// Runs teacher.forward_features (no host readback of grads — inference only) + the consensus heads.
+fn eval_consensus<BI: Backend>(
+    teacher: &Mnv4<BI>, cons: &ConsensusHeads<BI>, frames: &Frames, pv: &Paired, device: &BI::Device,
 ) -> f32 {
-    let w = Arc::new(Weighted::expr(&samples, train, 4.0));
-    let pools = Arc::new(Pools::expr_build(&samples, train));
-    let rx = spawn_prefetch(frames.clone(), samples.clone(), w, cfg.batch, cfg.workers, true, 0xE47, pools);
-    let mut model = Mnv4::<B>::new(T, 4, device);
-    load_pretrained_expr(&mut model);
-    let bn_ids: HashSet<ParamId> = model.running_state_ids().into_iter().collect();
-    let mut opt = AdamWConfig::new().with_weight_decay(cfg.wd).init();
-    let mut teacher = model.valid(); // EMA teacher (what we deploy/export), matches BabbleTrainer
-    let ema_every = 16usize;
-    let keep = 0.997f64.powi(ema_every as i32) as f32; // EMA teacher; ~333-step horizon (converges well
-                                                       // inside the single-stage budget while smoothing)
-    let mut best = f32::INFINITY;
-    let mut win = Instant::now();
-    // BB_PROF=1: measure recv-wait = time the main thread blocks on the prefetch channel. Large => the
-    // aug workers can't keep up (aug/CPU-feed bound). ~0 => workers keep up, so any GPU under-use is the
-    // single-threaded op dispatch, not the aug (read GPU power externally to confirm).
-    let prof = std::env::var("BB_PROF").is_ok();
-    let mut recv_acc = 0f32;
-    for step in 0..cfg.steps {
-        let r0 = Instant::now();
-        let (xs, ys) = rx.recv().unwrap();
-        if prof {
-            recv_acc += r0.elapsed().as_secs_f32();
+    if pv.is_empty() {
+        return 0.0;
+    }
+    let (mut se, mut cnt) = (0.0f32, 0usize);
+    let idxs: Vec<usize> = (0..pv.recs.len()).collect();
+    for chunk in idxs.chunks(256) {
+        let b = chunk.len();
+        let (mut xl, mut xr, mut tgt) = (Vec::new(), Vec::new(), Vec::new());
+        for &k in chunk {
+            let rec = pv.recs[k];
+            frames.stack_into(rec, 0, &mut xl);
+            frames.stack_into(rec, 1, &mut xr);
+            let (l, r) = (pv.ll[k], pv.rl[k]); // expr 4-vec = [lid,widen,squint,brow]; consensus = mean L/R
+            tgt.push(0.5 * (l[1] + r[1])); // widen
+            tgt.push(0.5 * (l[2] + r[2])); // squint
+            tgt.push(0.5 * (l[3] + r[3])); // brow
         }
-        let x = Tensor::<B, 4>::from_data(TensorData::new(xs, [cfg.batch, T, S, S]), device);
-        let y = Tensor::<B, 2>::from_data(TensorData::new(ys, [cfg.batch, 4]), device);
-        let loss = supervised_deconfuse(model.forward(x), y, device);
-        let gp = GradientsParams::from_grads(loss.backward(), &model);
-        model = opt.step(cos_lr(step, cfg.steps, cfg.warmup, cfg.lr), model, gp);
-        if step % ema_every == 0 {
-            teacher = ema_update::<B::InnerBackend, _>(teacher, &model.valid(), keep, &bn_ids);
-        }
-        if step % 100 == 99 {
-            let dt = win.elapsed().as_secs_f32();
-            if prof {
-                println!("[expr {step:5}] {:.1} ms/step | recv-wait(aug)={:.1} ms/step",
-                         dt * 10.0, recv_acc * 10.0);
-                recv_acc = 0.0;
-            } else {
-                println!("[expr {step:5}] {:.1} steps/s ({:.1} ms/step) windowed", 100.0 / dt, dt * 10.0);
-            }
-            win = Instant::now();
-        }
-        if step % cfg.val_every == 0 || step == cfg.steps - 1 {
-            teacher = ema_update::<B::InnerBackend, _>(teacher, &model.valid(), keep, &bn_ids); // fold latest steps
-            let (mse, r) = eval_expr(&teacher, &frames, &samples, val, device);
-            let tag = if mse < best { "*" } else { "" };
-            println!("[expr {step:5}/{}] mse={mse:.5} r({:.3} {:.3} {:.3} {:.3}) {tag}", cfg.steps, r[0], r[1], r[2], r[3]);
-            if mse < best {
-                best = mse;
-                teacher.clone().save_file(ckpt, &NamedMpkFileRecorder::<FullPrecisionSettings>::new()).unwrap();
-            }
+        let xl = Tensor::<BI, 4>::from_data(TensorData::new(xl, [b, T, S, S]), device);
+        let xr = Tensor::<BI, 4>::from_data(TensorData::new(xr, [b, T, S, S]), device);
+        let fl = teacher.forward_features(xl);
+        let fr = teacher.forward_features(xr);
+        let ws = cons.forward(0, fl.clone(), fr.clone()); // [b,2] widen,squint
+        let br = cons.forward(1, fl, fr); // [b,1] brow
+        let pred = Tensor::cat(vec![ws, br], 1).into_data().to_vec::<f32>().unwrap();
+        for (p, t) in pred.iter().zip(&tgt) {
+            se += (p - t).powi(2);
+            cnt += 1;
         }
     }
-    best
+    se / cnt.max(1) as f32
 }
 
 // 2-stage expression curriculum (BabbleTrainer fit_expr_stages), pretrained-backbone init, and
@@ -518,17 +500,24 @@ pub fn fit_expr_staged<B: AutodiffBackend>(
     // EXPR_EVEN_BATCH). Falls back to expr-only if the capture has no records with both eyes valid.
     let paired = Arc::new(Paired::build(&samples, train));
     let do_paired = !paired.is_empty();
+    let paired_val = Paired::build(&samples, val); // held-out paired eyes for the consensus val metric
     let pbatch = (cfg.batch / 2).max(1);
     let prx = do_paired.then(|| {
         spawn_paired_prefetch(frames.clone(), paired.clone(), pbatch, cfg.workers, 0x9A17)
     });
-    let cons_ckpt = ckpt.replace("expr", "cons");
+    // Explicit consensus checkpoint path — never a blind replace that could collide with the expr ckpt
+    // if it lacks "expr". Delete any stale one up front so a run that trains no consensus (no paired
+    // data) can't leave an old cons that export_bridge would wrongly fuse into a 15-dim brow.
+    let cons_ckpt = if ckpt.contains("expr") { ckpt.replace("expr", "cons") } else { format!("{ckpt}.cons") };
+    let _ = std::fs::remove_file(&cons_ckpt);
 
     // Semi-supervised anti-jitter stream (mean-teacher + temporal), stage B only. ub = batch.
     let unlab = Arc::new(Unlabeled::build(&samples, train));
     let do_unlab = !unlab.is_empty();
     let ub = cfg.batch;
-    let urx = do_unlab.then(|| spawn_unlabeled_prefetch(frames.clone(), unlab.clone(), ub, cfg.workers, 0x51A9));
+    // (rec,side) of every GOOD decoded eye — lets the temporal stream reject blank/non-good neighbors.
+    let present: Arc<HashSet<(usize, usize)>> = Arc::new(samples.iter().map(|s| (s.rec, s.side)).collect());
+    let urx = do_unlab.then(|| spawn_unlabeled_prefetch(frames.clone(), unlab.clone(), present.clone(), ub, cfg.workers, 0x51A9));
     println!("[expr] paired={} ({} recs) unlabeled={} ({} frames)", do_paired, paired.recs.len(), do_unlab, unlab.items.len());
 
     let mut model = Mnv4::<B>::new(T, 4, device);
@@ -547,6 +536,7 @@ pub fn fit_expr_staged<B: AutodiffBackend>(
     let mut best = f32::INFINITY;
     let mut win = Instant::now();
     let cos = |p: f64| 0.5 * (1.0 + (std::f64::consts::PI * p).cos());
+    let lc = ExprConsts::<B>::new(device); // per-step loss constants, built once (not from_floats/step)
 
     // BB_PROF=1: per-phase host-time breakdown (dispatch cost) + an end-of-step sync so GPU tail time
     // shows up as `sync` instead of hiding inside the next step's first blocking call.
@@ -576,6 +566,13 @@ pub fn fit_expr_staged<B: AutodiffBackend>(
         };
         if stage_b && step == a_steps {
             teacher = model.valid(); // fresh teacher at stage B (matches reference EMATeacher reset)
+            if do_paired {
+                // The deployed 15-dim model fuses brow to the consensus head, which ONLY trains in
+                // stage B. Reset best so the exported checkpoint is selected from stage B, pairing the
+                // saved teacher with a TRAINED consensus — a stage-A best would export a near-init
+                // consensus and a flat deployed brow. See audit/BABBLEBURN_VS_GOALPOST.md.
+                best = f32::INFINITY;
+            }
         }
 
         // One student forward over the concatenated mega-batch (matches reference xcat): the supervised
@@ -608,10 +605,27 @@ pub fn fit_expr_staged<B: AutodiffBackend>(
             sdata.extend_from_slice(nw);
             rows += ub;
         }
+        // Pack ALL labels (supervised y, paired pll/prl, temporal pair_ok) into one host buffer so they
+        // upload in a single h2d and are sliced on-device (OPT #12). Offsets are in ELEMENTS.
+        let mut lbl = ys;
+        let y_end = lbl.len(); // cfg.batch * 4
+        let (mut pll_off, mut prl_off, mut ok_off) = (0usize, 0usize, 0usize);
+        if let Some((_, _, plld, prld)) = &paired_b {
+            pll_off = lbl.len();
+            lbl.extend_from_slice(plld);
+            prl_off = lbl.len();
+            lbl.extend_from_slice(prld);
+        }
+        if let Some((_, _, _, ok)) = &unlab_b {
+            ok_off = lbl.len();
+            lbl.extend_from_slice(ok);
+        }
+        let lbl_len = lbl.len();
         pt[0] += t0.elapsed().as_secs_f32();
 
         let t0 = Instant::now();
-        let y = Tensor::<B, 2>::from_data(TensorData::new(ys, [cfg.batch, 4]), device);
+        let lbl_t = Tensor::<B, 1>::from_data(TensorData::new(lbl, [lbl_len]), device);
+        let y = lbl_t.clone().slice([0..y_end]).reshape([cfg.batch, 4]);
         // Upload the mega-batch ONCE as an inner (non-autodiff) tensor; the student consumes it via
         // from_inner (inputs need no grad) and the teacher slices it directly — no duplicate h2d.
         let big_i = Tensor::<B::InnerBackend, 4>::from_data(TensorData::new(sdata, [rows, T, S, S]), device);
@@ -620,7 +634,7 @@ pub fn fit_expr_staged<B: AutodiffBackend>(
 
         let t0 = Instant::now();
         let out = model.forward(Tensor::from_inner(big_i.clone()));
-        let mut loss = supervised_deconfuse(out.clone().slice([0..cfg.batch]), y, device);
+        let mut loss = supervised_deconfuse(out.clone().slice([0..cfg.batch]), y, &lc.deconf);
         psync(micro);
         pt[2] += t0.elapsed().as_secs_f32();
         let t0 = Instant::now();
@@ -646,12 +660,12 @@ pub fn fit_expr_staged<B: AutodiffBackend>(
 
         // Evenness (both stages) + consensus (stage B) on the paired eyes.
         let mut cons_step = false;
-        if let Some((_, _, plld, prld)) = &paired_b {
+        if paired_b.is_some() {
             let out_pl = out.clone().slice([off_pl..off_pl + pbatch]);
             let out_pr = out.clone().slice([off_pr..off_pr + pbatch]);
-            let pll = Tensor::<B, 2>::from_data(TensorData::new(plld.clone(), [pbatch, 4]), device);
-            let prl = Tensor::<B, 2>::from_data(TensorData::new(prld.clone(), [pbatch, 4]), device);
-            loss = loss + evenness(out_pl, out_pr, pll.clone(), prl.clone(), device);
+            let pll = lbl_t.clone().slice([pll_off..pll_off + pbatch * 4]).reshape([pbatch, 4]);
+            let prl = lbl_t.clone().slice([prl_off..prl_off + pbatch * 4]).reshape([pbatch, 4]);
+            loss = loss + evenness(out_pl, out_pr, pll.clone(), prl.clone(), &lc.even_w);
             if stage_b {
                 let tf = tfeats.as_ref().unwrap();
                 let fl = Tensor::from_inner(tf.clone().slice([0..pbatch]));
@@ -667,7 +681,7 @@ pub fn fit_expr_staged<B: AutodiffBackend>(
 
         // Mean-teacher (strong<->weak consistency, quadratic ramp) + temporal smoothness (adjacent
         // frames within margin), stage B, on the unlabeled in-domain stream.
-        if let Some((_, _, _, ok)) = &unlab_b {
+        if unlab_b.is_some() {
             let cs_out = out.clone().slice([off_cs..off_cs + ub]);
             let cw_out = out.clone().slice([off_cw..off_cw + ub]);
             let nw_out = out.clone().slice([off_nw..off_nw + ub]);
@@ -676,8 +690,8 @@ pub fn fit_expr_staged<B: AutodiffBackend>(
             let rampup = (b_steps / 4).max(1) as f64;
             let lam = (((step - a_steps) as f64 / rampup).min(1.0).powi(2)) as f32; // lambda_cons = 1.0
             loss = loss + mt_consistency(cs_out, t_out).mul_scalar(lam);
-            let ok_t = Tensor::<B, 1>::from_data(TensorData::new(ok.clone(), [ub]), device);
-            loss = loss + temporal(cw_out, nw_out, ok_t, device).mul_scalar(0.1); // lambda_temp = 0.1
+            let ok_t = lbl_t.clone().slice([ok_off..ok_off + ub]);
+            loss = loss + temporal(cw_out, nw_out, ok_t, &lc.margin).mul_scalar(0.1); // lambda_temp = 0.1
         }
         psync(micro);
         pt[3] += t0.elapsed().as_secs_f32();
@@ -726,11 +740,21 @@ pub fn fit_expr_staged<B: AutodiffBackend>(
             let keep = decay.powi(ema_every as i32) as f32;
             teacher = ema_update::<B::InnerBackend, _>(teacher, &model.valid(), keep, &bn_ids);
             let (mse, r) = eval_expr(&teacher, &frames, &samples, val, device);
-            let tag = if mse < best { "*" } else { "" };
+            // In stage B the deployed model is the fused 15-dim output, so select on main-head MSE PLUS
+            // the consensus (widen/squint/brow) val MSE. This refuses the first stage-B step (consensus
+            // near-init -> flat, high cons MSE) in favor of one where the consensus has actually trained,
+            // and saves the teacher + same-step consensus together (BUGS #1). Both are MSE in [0,1].
+            let cons_mse = if stage_b && do_paired {
+                eval_consensus(&teacher, &cons.valid(), &frames, &paired_val, device)
+            } else {
+                0.0
+            };
+            let score = mse + cons_mse;
+            let tag = if score < best { "*" } else { "" };
             let st = if stage_b { "B" } else { "A" };
-            println!("[expr {st} {step:5}/{}] mse={mse:.5} r({:.3} {:.3} {:.3} {:.3}) {tag}", cfg.steps, r[0], r[1], r[2], r[3]);
-            if mse < best {
-                best = mse;
+            println!("[expr {st} {step:5}/{}] mse={mse:.5} cons={cons_mse:.5} r({:.3} {:.3} {:.3} {:.3}) {tag}", cfg.steps, r[0], r[1], r[2], r[3]);
+            if score < best {
+                best = score;
                 let rec = NamedMpkFileRecorder::<FullPrecisionSettings>::new();
                 teacher.clone().save_file(ckpt, &rec).unwrap();
                 if stage_b && do_paired {

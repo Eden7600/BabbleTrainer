@@ -25,6 +25,7 @@ struct Blend<'a> {
     store: GradientsParams,
     keep: f32, // teacher weight; student weight = 1-keep (learnable params only)
     copy: &'a HashSet<ParamId>, // BN running-stat ids: take the student value verbatim
+    misses: usize, // teacher params with no matching student ParamId (a structure/ordering bug)
 }
 impl<B: Backend> ModuleMapper<B> for Blend<'_> {
     fn map_float<const D: usize>(&mut self, p: Param<Tensor<B, D>>) -> Param<Tensor<B, D>> {
@@ -33,17 +34,26 @@ impl<B: Backend> ModuleMapper<B> for Blend<'_> {
         match self.store.get::<B, D>(id) {
             Some(s) if self.copy.contains(&id) => Param::initialized(id, s), // buffer copy
             Some(s) => Param::initialized(id, t.mul_scalar(self.keep) + s.mul_scalar(1.0 - self.keep)),
-            None => Param::initialized(id, t),
+            None => {
+                // No student match => teacher weight frozen. Silent today only because head param
+                // ordering happens to line up; count so a future reorder fails loudly, not silently.
+                self.misses += 1;
+                Param::initialized(id, t)
+            }
         }
     }
 }
 
 // ParamIds are stable across optimizer steps + valid(), so the lookup matches by identity, not
-// traversal order. `copy` = the BN running-stat ids to hard-copy from the student.
+// traversal order. `copy` = the BN running-stat ids to hard-copy from the student. Panics if any
+// teacher param fails to match a student ParamId (would ship a frozen/random-init weight otherwise).
 pub fn ema_update<B: Backend, M: Module<B>>(
     teacher: M, student: &M, keep: f32, copy: &HashSet<ParamId>,
 ) -> M {
     let mut c = Collect { store: GradientsParams::new() };
     student.visit(&mut c);
-    teacher.map(&mut Blend { store: c.store, keep, copy })
+    let mut blend = Blend { store: c.store, keep, copy, misses: 0 };
+    let out = teacher.map(&mut blend);
+    assert!(blend.misses == 0, "EMA: {} teacher params had no matching student ParamId (teacher/student diverged)", blend.misses);
+    out
 }
