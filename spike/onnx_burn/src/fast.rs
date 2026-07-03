@@ -541,7 +541,12 @@ pub fn fit_expr_staged<B: AutodiffBackend>(
 
     // BB_PROF=1: per-phase host-time breakdown (dispatch cost) + an end-of-step sync so GPU tail time
     // shows up as `sync` instead of hiding inside the next step's first blocking call.
-    let prof = std::env::var("BB_PROF").is_ok();
+    // BB_PROF=2: micro mode — device sync after EVERY phase, so each bucket = dispatch + GPU execution
+    // of that phase (serializes the pipeline; compare against mode 1 + unprofiled wall for truth).
+    let prof_lvl: u8 = std::env::var("BB_PROF").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+    let prof = prof_lvl >= 1;
+    let micro = prof_lvl >= 2;
+    let psync = |on: bool| { if on { let _ = B::sync(device); } };
     let mut pt = [0f32; 8]; // recv h2d fwd aux bwd opt ema sync
 
     for step in 0..cfg.steps {
@@ -601,11 +606,13 @@ pub fn fit_expr_staged<B: AutodiffBackend>(
         // Upload the mega-batch ONCE as an inner (non-autodiff) tensor; the student consumes it via
         // from_inner (inputs need no grad) and the teacher slices it directly — no duplicate h2d.
         let big_i = Tensor::<B::InnerBackend, 4>::from_data(TensorData::new(sdata, [rows, T, S, S]), device);
+        psync(micro);
         pt[1] += t0.elapsed().as_secs_f32();
 
         let t0 = Instant::now();
         let out = model.forward(Tensor::from_inner(big_i.clone()));
         let mut loss = supervised_deconfuse(out.clone().slice([0..cfg.batch]), y, device);
+        psync(micro);
         pt[2] += t0.elapsed().as_secs_f32();
         let t0 = Instant::now();
 
@@ -663,10 +670,12 @@ pub fn fit_expr_staged<B: AutodiffBackend>(
             let ok_t = Tensor::<B, 1>::from_data(TensorData::new(ok.clone(), [ub]), device);
             loss = loss + temporal(cw_out, nw_out, ok_t, device).mul_scalar(0.1); // lambda_temp = 0.1
         }
+        psync(micro);
         pt[3] += t0.elapsed().as_secs_f32();
 
         let t0 = Instant::now();
         let mut grads = loss.backward();
+        psync(micro);
         pt[4] += t0.elapsed().as_secs_f32();
         let t0 = Instant::now();
         let head_gp = GradientsParams::from_params(&mut grads, &model, &head_ids);
@@ -679,6 +688,7 @@ pub fn fit_expr_staged<B: AutodiffBackend>(
             let cons_gp = GradientsParams::from_module(&mut grads, &cons);
             cons = opt_cons.step(lr_head, cons, cons_gp);
         }
+        psync(micro);
         pt[5] += t0.elapsed().as_secs_f32();
 
         let t0 = Instant::now();
@@ -686,6 +696,7 @@ pub fn fit_expr_staged<B: AutodiffBackend>(
             let keep = decay.powi(ema_every as i32) as f32;
             teacher = ema_update::<B::InnerBackend, _>(teacher, &model.valid(), keep);
         }
+        psync(micro);
         pt[6] += t0.elapsed().as_secs_f32();
         if prof {
             let t0 = Instant::now();
@@ -735,7 +746,10 @@ pub fn fit_gaze_fast<B: AutodiffBackend>(
     let mut win = Instant::now();
     // Gaze deploys the STUDENT (BabbleTrainer only uses a gaze EMA teacher under semi-supervised
     // mean-teacher, wired separately).
-    let prof = std::env::var("BB_PROF").is_ok();
+    let prof_lvl: u8 = std::env::var("BB_PROF").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+    let prof = prof_lvl >= 1;
+    let micro = prof_lvl >= 2;
+    let psync = |on: bool| { if on { let _ = B::sync(device); } };
     let mut pt = [0f32; 5]; // recv h2d fwd bwd+opt sync
     for step in 0..cfg.steps {
         let t0 = Instant::now();
@@ -744,13 +758,16 @@ pub fn fit_gaze_fast<B: AutodiffBackend>(
         let t0 = Instant::now();
         let x = Tensor::<B, 4>::from_data(TensorData::new(xs, [cfg.batch, T, S, S]), device);
         let y = Tensor::<B, 2>::from_data(TensorData::new(ys, [cfg.batch, 2]), device);
+        psync(micro);
         pt[1] += t0.elapsed().as_secs_f32();
         let t0 = Instant::now();
         let loss = (model.forward(x) - y).powf_scalar(2.0).mean();
+        psync(micro);
         pt[2] += t0.elapsed().as_secs_f32();
         let t0 = Instant::now();
         let gp = GradientsParams::from_grads(loss.backward(), &model);
         model = opt.step(cos_lr(step, cfg.steps, cfg.warmup, cfg.lr), model, gp);
+        psync(micro);
         pt[3] += t0.elapsed().as_secs_f32();
         if prof {
             let t0 = Instant::now();
