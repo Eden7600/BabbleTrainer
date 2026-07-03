@@ -539,6 +539,11 @@ pub fn fit_expr_staged<B: AutodiffBackend>(
     let mut win = Instant::now();
     let cos = |p: f64| 0.5 * (1.0 + (std::f64::consts::PI * p).cos());
 
+    // BB_PROF=1: per-phase host-time breakdown (dispatch cost) + an end-of-step sync so GPU tail time
+    // shows up as `sync` instead of hiding inside the next step's first blocking call.
+    let prof = std::env::var("BB_PROF").is_ok();
+    let mut pt = [0f32; 8]; // recv h2d fwd aux bwd opt ema sync
+
     for step in 0..cfg.steps {
         let stage_b = step >= a_steps;
         // per-stage LR schedule + freeze + EMA stride
@@ -562,8 +567,8 @@ pub fn fit_expr_staged<B: AutodiffBackend>(
         // One student forward over the concatenated mega-batch (matches reference xcat): the supervised
         // batch, the paired eyes (evenness), and the stage-B unlabeled strong/weak/neighbor views
         // (mean-teacher + temporal). Auxiliary streams cost forward rows but never touch the regime.
+        let t0 = Instant::now();
         let (mut sdata, ys) = rx.recv().unwrap();
-        let y = Tensor::<B, 2>::from_data(TensorData::new(ys, [cfg.batch, 4]), device);
         let mut rows = cfg.batch;
 
         let paired_b = prx.as_ref().map(|p| p.recv().unwrap());
@@ -589,10 +594,18 @@ pub fn fit_expr_staged<B: AutodiffBackend>(
             sdata.extend_from_slice(nw);
             rows += ub;
         }
+        pt[0] += t0.elapsed().as_secs_f32();
 
+        let t0 = Instant::now();
+        let y = Tensor::<B, 2>::from_data(TensorData::new(ys, [cfg.batch, 4]), device);
         let big = Tensor::<B, 4>::from_data(TensorData::new(sdata, [rows, T, S, S]), device);
+        pt[1] += t0.elapsed().as_secs_f32();
+
+        let t0 = Instant::now();
         let out = model.forward(big);
         let mut loss = supervised_deconfuse(out.clone().slice([0..cfg.batch]), y, device);
+        pt[2] += t0.elapsed().as_secs_f32();
+        let t0 = Instant::now();
 
         // Evenness (both stages) + consensus (stage B) on the paired eyes.
         let mut cons_step = false;
@@ -632,8 +645,12 @@ pub fn fit_expr_staged<B: AutodiffBackend>(
             let ok_t = Tensor::<B, 1>::from_data(TensorData::new(ok.clone(), [ub]), device);
             loss = loss + temporal(cw_out, nw_out, ok_t, device).mul_scalar(0.1); // lambda_temp = 0.1
         }
+        pt[3] += t0.elapsed().as_secs_f32();
 
+        let t0 = Instant::now();
         let mut grads = loss.backward();
+        pt[4] += t0.elapsed().as_secs_f32();
+        let t0 = Instant::now();
         let head_gp = GradientsParams::from_params(&mut grads, &model, &head_ids);
         let bb_gp = GradientsParams::from_module(&mut grads, &model); // remaining = backbone
         model = opt_head.step(lr_head, model, head_gp);
@@ -644,14 +661,27 @@ pub fn fit_expr_staged<B: AutodiffBackend>(
             let cons_gp = GradientsParams::from_module(&mut grads, &cons);
             cons = opt_cons.step(lr_head, cons, cons_gp);
         }
+        pt[5] += t0.elapsed().as_secs_f32();
 
+        let t0 = Instant::now();
         if step % ema_every == 0 {
             let keep = decay.powi(ema_every as i32) as f32;
             teacher = ema_update::<B::InnerBackend, _>(teacher, &model.valid(), keep);
         }
+        pt[6] += t0.elapsed().as_secs_f32();
+        if prof {
+            let t0 = Instant::now();
+            let _ = out.slice([0..1, 0..1]).into_data(); // force queue drain: GPU tail time
+            pt[7] += t0.elapsed().as_secs_f32();
+        }
         if step % 100 == 99 {
             let dt = win.elapsed().as_secs_f32();
             println!("[expr {step:5}] {:.1} ms/step ({}) windowed", dt * 10.0, if stage_b { "B" } else { "A" });
+            if prof {
+                println!("[prof {step:5}] recv={:.1} h2d={:.1} fwd={:.1} aux={:.1} bwd={:.1} opt={:.1} ema={:.1} sync={:.1} ms/step",
+                    pt[0] * 10.0, pt[1] * 10.0, pt[2] * 10.0, pt[3] * 10.0, pt[4] * 10.0, pt[5] * 10.0, pt[6] * 10.0, pt[7] * 10.0);
+                pt = [0.0; 8];
+            }
             win = Instant::now();
         }
         if step % cfg.val_every == 0 || step == cfg.steps - 1 {
@@ -687,16 +717,36 @@ pub fn fit_gaze_fast<B: AutodiffBackend>(
     let mut win = Instant::now();
     // Gaze deploys the STUDENT (BabbleTrainer only uses a gaze EMA teacher under semi-supervised
     // mean-teacher, wired separately).
+    let prof = std::env::var("BB_PROF").is_ok();
+    let mut pt = [0f32; 5]; // recv h2d fwd bwd+opt sync
     for step in 0..cfg.steps {
+        let t0 = Instant::now();
         let (xs, ys) = rx.recv().unwrap();
+        pt[0] += t0.elapsed().as_secs_f32();
+        let t0 = Instant::now();
         let x = Tensor::<B, 4>::from_data(TensorData::new(xs, [cfg.batch, T, S, S]), device);
         let y = Tensor::<B, 2>::from_data(TensorData::new(ys, [cfg.batch, 2]), device);
+        pt[1] += t0.elapsed().as_secs_f32();
+        let t0 = Instant::now();
         let loss = (model.forward(x) - y).powf_scalar(2.0).mean();
+        pt[2] += t0.elapsed().as_secs_f32();
+        let t0 = Instant::now();
         let gp = GradientsParams::from_grads(loss.backward(), &model);
         model = opt.step(cos_lr(step, cfg.steps, cfg.warmup, cfg.lr), model, gp);
+        pt[3] += t0.elapsed().as_secs_f32();
+        if prof {
+            let t0 = Instant::now();
+            let _ = loss.into_data(); // force queue drain: GPU tail time
+            pt[4] += t0.elapsed().as_secs_f32();
+        }
         if step % 100 == 99 {
             let dt = win.elapsed().as_secs_f32();
             println!("[gaze {step:5}] {:.1} steps/s ({:.1} ms/step) windowed", 100.0 / dt, dt * 10.0);
+            if prof {
+                println!("[gprof {step:5}] recv={:.1} h2d={:.1} fwd={:.1} bwd+opt={:.1} sync={:.1} ms/step",
+                    pt[0] * 10.0, pt[1] * 10.0, pt[2] * 10.0, pt[3] * 10.0, pt[4] * 10.0);
+                pt = [0.0; 5];
+            }
             win = Instant::now();
         }
         if step % cfg.val_every == 0 || step == cfg.steps - 1 {
