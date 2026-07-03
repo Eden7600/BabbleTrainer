@@ -19,6 +19,25 @@ fn sample_geom_strong(rng: &mut Rng) -> Geom {
     Geom { angle: uni(rng, -10.0, 10.0), tx: uni(rng, -0.08, 0.08), ty: uni(rng, -0.08, 0.08), scale: uni(rng, 0.85, 1.15) }
 }
 
+// sample_geom(strong=False): mild geom for the weak (teacher/temporal) view.
+pub fn sample_geom_weak(rng: &mut Rng) -> Geom {
+    Geom { angle: uni(rng, -3.0, 3.0), tx: uni(rng, -0.03, 0.03), ty: uni(rng, -0.03, 0.03), scale: uni(rng, 0.97, 1.03) }
+}
+
+// _aug_weak: apply a GIVEN geom (shared between cur/neighbor for temporal) + weak brightness (±0.10).
+pub fn aug_stack_weak(stack: &mut [f32], g: &Geom, rng: &mut Rng) {
+    let bright = uni(rng, -0.10, 0.10);
+    let mut tmp = vec![0.0f32; S * S];
+    for t in 0..T {
+        let fr = &mut stack[t * S * S..(t + 1) * S * S];
+        tmp.copy_from_slice(fr);
+        apply_geom(&tmp, fr, g);
+        for p in fr.iter_mut() {
+            *p = (*p + bright).clamp(0.0, 1.0);
+        }
+    }
+}
+
 // cv2.warpAffine(getRotationMatrix2D(center, angle, scale) + translation), INTER_LINEAR,
 // BORDER_REPLICATE. warpAffine maps dst<-src via the INVERSE of the forward matrix, so we invert.
 fn apply_geom(src: &[f32], dst: &mut [f32], g: &Geom) {

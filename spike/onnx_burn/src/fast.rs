@@ -18,7 +18,7 @@ use crate::data::{process_eye, Bin, Sample, S, T};
 use crate::ema::ema_update;
 use crate::gaze::MicroChad;
 use crate::heads::ConsensusHeads;
-use crate::losses::{consensus_term, evenness, supervised_deconfuse};
+use crate::losses::{consensus_term, evenness, mt_consistency, supervised_deconfuse, temporal};
 use crate::mnv4::Mnv4;
 use crate::sampler::{gaze_weights, Rng, Weighted};
 
@@ -117,6 +117,65 @@ impl Paired {
     fn is_empty(&self) -> bool {
         self.recs.is_empty()
     }
+}
+
+// Unlabeled anti-jitter stream = the capture's own FLAG_EXPR_UNLABELED (free-expression gaze-section)
+// frames — the same in-domain footage the frontend uses. Yields (cur_strong, cur_weak, nbr_weak,
+// pair_ok) for the mean-teacher + temporal-smoothness losses (stage B).
+pub struct Unlabeled {
+    items: Vec<(usize, usize)>, // (rec, side)
+}
+impl Unlabeled {
+    fn build(samples: &[Sample], train: &[usize]) -> Self {
+        let items = train
+            .iter()
+            .filter_map(|&i| {
+                let s = &samples[i];
+                (s.expr_unlabeled > 0.5).then_some((s.rec, s.side))
+            })
+            .collect();
+        Self { items }
+    }
+    fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+}
+
+type UnlabBatch = (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>); // cur_strong, cur_weak, nbr_weak, pair_ok
+
+fn spawn_unlabeled_prefetch(
+    frames: Arc<Frames>, unlab: Arc<Unlabeled>, ub: usize, workers: usize, seed: u64,
+) -> Receiver<UnlabBatch> {
+    let (tx, rx) = sync_channel::<UnlabBatch>(workers * 2);
+    for wi in 0..workers.max(1) {
+        let (frames, unlab, tx) = (frames.clone(), unlab.clone(), tx.clone());
+        thread::spawn(move || {
+            let mut rng = Rng::new(seed.wrapping_add((wi as u64).wrapping_mul(0x85EBCA77)));
+            let mut scratch = Vec::new();
+            loop {
+                let (mut cs, mut cw, mut nw, mut ok) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+                for _ in 0..ub {
+                    let (rec, side) = unlab.items[rng.usize(unlab.items.len())];
+                    let mut a = frames.stack_f32(rec, side);
+                    aug::aug_stack_expr(&mut a, &mut rng, &mut scratch); // strong view
+                    let g = aug::sample_geom_weak(&mut rng); // shared geom for cur/nbr weak views
+                    let mut b = frames.stack_f32(rec, side);
+                    aug::aug_stack_weak(&mut b, &g, &mut rng);
+                    let pair_ok = if rec >= 1 { 1.0 } else { 0.0 };
+                    let mut c = frames.stack_f32(if rec >= 1 { rec - 1 } else { rec }, side);
+                    aug::aug_stack_weak(&mut c, &g, &mut rng);
+                    cs.extend_from_slice(&a);
+                    cw.extend_from_slice(&b);
+                    nw.extend_from_slice(&c);
+                    ok.push(pair_ok);
+                }
+                if tx.send((cs, cw, nw, ok)).is_err() {
+                    break;
+                }
+            }
+        });
+    }
+    rx
 }
 
 type PairedBatch = (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>); // pl, pr, pll(4), prl(4)
@@ -427,10 +486,10 @@ pub fn fit_expr_fast<B: AutodiffBackend>(
 // into stage A + stage B), batch = cfg.batch, so the per-user regime is preserved. Reference LRs are
 // batch-64 values scaled by sqrt(batch/64), matching config.py's own batch-scaling rule.
 //
-// Stage A: supervised (deconfuse) + mixup only; backbone frozen for the warmup, head-only at a higher
-// LR; then unfreeze with backbone 1e-4 / head 5e-4 (cosine); EMA stride 25.
-// Stage B: init continues from A (teacher reset); backbone 5e-5 / head 2e-4 (cosine); EMA stride 1.
-// (Consensus / evenness / mean-teacher are layered on top in later increments.)
+// Stage A: supervised (deconfuse) + mixup + evenness; backbone frozen for the warmup, head-only at a
+// higher LR; then unfreeze with backbone 1e-4 / head 5e-4 (cosine); EMA stride 25.
+// Stage B: init continues from A (teacher reset); backbone 5e-5 / head 2e-4 (cosine); EMA stride 1;
+// adds the consensus head, mean-teacher consistency, and temporal smoothness on the unlabeled stream.
 pub fn fit_expr_staged<B: AutodiffBackend>(
     frames: Arc<Frames>, samples: Arc<Vec<Sample>>, train: &[usize], val: &[usize], cfg: &FastCfg,
     device: &B::Device, ckpt: &str,
@@ -456,6 +515,13 @@ pub fn fit_expr_staged<B: AutodiffBackend>(
         spawn_paired_prefetch(frames.clone(), paired.clone(), pbatch, cfg.workers, 0x9A17)
     });
     let cons_ckpt = ckpt.replace("expr", "cons");
+
+    // Semi-supervised anti-jitter stream (mean-teacher + temporal), stage B only. ub = batch.
+    let unlab = Arc::new(Unlabeled::build(&samples, train));
+    let do_unlab = !unlab.is_empty();
+    let ub = cfg.batch;
+    let urx = do_unlab.then(|| spawn_unlabeled_prefetch(frames.clone(), unlab.clone(), ub, cfg.workers, 0x51A9));
+    println!("[expr] paired={} ({} recs) unlabeled={} ({} frames)", do_paired, paired.recs.len(), do_unlab, unlab.items.len());
 
     let mut model = Mnv4::<B>::new(T, 4, device);
     if load_pretrained_expr(&mut model) {
@@ -493,28 +559,54 @@ pub fn fit_expr_staged<B: AutodiffBackend>(
             teacher = model.valid(); // fresh teacher at stage B (matches reference EMATeacher reset)
         }
 
-        let (xs, ys) = rx.recv().unwrap();
-        let x = Tensor::<B, 4>::from_data(TensorData::new(xs, [cfg.batch, T, S, S]), device);
+        // One student forward over the concatenated mega-batch (matches reference xcat): the supervised
+        // batch, the paired eyes (evenness), and the stage-B unlabeled strong/weak/neighbor views
+        // (mean-teacher + temporal). Auxiliary streams cost forward rows but never touch the regime.
+        let (mut sdata, ys) = rx.recv().unwrap();
         let y = Tensor::<B, 2>::from_data(TensorData::new(ys, [cfg.batch, 4]), device);
-        let mut loss = supervised_deconfuse(model.forward(x), y, device);
+        let mut rows = cfg.batch;
 
-        // Paired-eye terms. Evenness (agree-gated L/R symmetry on the student) runs in both stages;
-        // consensus (two-eye head on detached teacher features, target = mean of L/R labels) in stage B.
+        let paired_b = prx.as_ref().map(|p| p.recv().unwrap());
+        let (mut off_pl, mut off_pr) = (0usize, 0usize);
+        if let Some((pld, prd, _, _)) = &paired_b {
+            off_pl = rows;
+            sdata.extend_from_slice(pld);
+            rows += pbatch;
+            off_pr = rows;
+            sdata.extend_from_slice(prd);
+            rows += pbatch;
+        }
+        let unlab_b = if stage_b { urx.as_ref().map(|u| u.recv().unwrap()) } else { None };
+        let (mut off_cs, mut off_cw, mut off_nw) = (0usize, 0usize, 0usize);
+        if let Some((cs, cw, nw, _)) = &unlab_b {
+            off_cs = rows;
+            sdata.extend_from_slice(cs);
+            rows += ub;
+            off_cw = rows;
+            sdata.extend_from_slice(cw);
+            rows += ub;
+            off_nw = rows;
+            sdata.extend_from_slice(nw);
+            rows += ub;
+        }
+
+        let big = Tensor::<B, 4>::from_data(TensorData::new(sdata, [rows, T, S, S]), device);
+        let out = model.forward(big);
+        let mut loss = supervised_deconfuse(out.clone().slice([0..cfg.batch]), y, device);
+
+        // Evenness (both stages) + consensus (stage B) on the paired eyes.
         let mut cons_step = false;
-        if let Some(prx) = &prx {
-            let (pld, prd, plld, prld) = prx.recv().unwrap();
-            let pl_x = Tensor::<B, 4>::from_data(TensorData::new(pld.clone(), [pbatch, T, S, S]), device);
-            let pr_x = Tensor::<B, 4>::from_data(TensorData::new(prd.clone(), [pbatch, T, S, S]), device);
-            let pll = Tensor::<B, 2>::from_data(TensorData::new(plld, [pbatch, 4]), device);
-            let prl = Tensor::<B, 2>::from_data(TensorData::new(prld, [pbatch, 4]), device);
-            let out_pl = model.forward(pl_x);
-            let out_pr = model.forward(pr_x);
+        if let Some((pld, prd, plld, prld)) = &paired_b {
+            let out_pl = out.clone().slice([off_pl..off_pl + pbatch]);
+            let out_pr = out.clone().slice([off_pr..off_pr + pbatch]);
+            let pll = Tensor::<B, 2>::from_data(TensorData::new(plld.clone(), [pbatch, 4]), device);
+            let prl = Tensor::<B, 2>::from_data(TensorData::new(prld.clone(), [pbatch, 4]), device);
             loss = loss + evenness(out_pl, out_pr, pll.clone(), prl.clone(), device);
             if stage_b {
                 // detached teacher features (matches deployment, where consensus runs on the exported
                 // teacher); autodiff grads flow only into the consensus heads.
-                let pl_i = Tensor::<B::InnerBackend, 4>::from_data(TensorData::new(pld, [pbatch, T, S, S]), device);
-                let pr_i = Tensor::<B::InnerBackend, 4>::from_data(TensorData::new(prd, [pbatch, T, S, S]), device);
+                let pl_i = Tensor::<B::InnerBackend, 4>::from_data(TensorData::new(pld.clone(), [pbatch, T, S, S]), device);
+                let pr_i = Tensor::<B::InnerBackend, 4>::from_data(TensorData::new(prd.clone(), [pbatch, T, S, S]), device);
                 let fl = Tensor::<B, 2>::from_data(teacher.forward_features(pl_i).into_data(), device);
                 let fr = Tensor::<B, 2>::from_data(teacher.forward_features(pr_i).into_data(), device);
                 let tgt = (pll + prl).mul_scalar(0.5);
@@ -524,6 +616,21 @@ pub fn fit_expr_staged<B: AutodiffBackend>(
                 loss = loss + consensus_term(cons.forward(1, fl, fr), g1);
                 cons_step = true;
             }
+        }
+
+        // Mean-teacher (strong<->weak consistency, quadratic ramp) + temporal smoothness (adjacent
+        // frames within margin), stage B, on the unlabeled in-domain stream.
+        if let Some((_, cw, _, ok)) = &unlab_b {
+            let cs_out = out.clone().slice([off_cs..off_cs + ub]);
+            let cw_out = out.clone().slice([off_cw..off_cw + ub]);
+            let nw_out = out.clone().slice([off_nw..off_nw + ub]);
+            let cw_i = Tensor::<B::InnerBackend, 4>::from_data(TensorData::new(cw.clone(), [ub, T, S, S]), device);
+            let t_out = Tensor::<B, 2>::from_data(teacher.classify(teacher.forward_features(cw_i)).into_data(), device);
+            let rampup = (b_steps / 4).max(1) as f64;
+            let lam = (((step - a_steps) as f64 / rampup).min(1.0).powi(2)) as f32; // lambda_cons = 1.0
+            loss = loss + mt_consistency(cs_out, t_out).mul_scalar(lam);
+            let ok_t = Tensor::<B, 1>::from_data(TensorData::new(ok.clone(), [ub]), device);
+            loss = loss + temporal(cw_out, nw_out, ok_t, device).mul_scalar(0.1); // lambda_temp = 0.1
         }
 
         let mut grads = loss.backward();

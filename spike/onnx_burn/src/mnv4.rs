@@ -159,6 +159,11 @@ impl<B: Backend> Mnv4<B> {
         self.classifier.forward(self.forward_features(x))
     }
 
+    // Head applied to precomputed features (lets the teacher reuse one forward_features pass).
+    pub fn classify(&self, feat: Tensor<B, 2>) -> Tensor<B, 2> {
+        self.classifier.forward(feat)
+    }
+
     // Classifier (head) param ids — used to split backbone vs head into separate optimizer groups.
     pub fn head_ids(&self) -> Vec<burn::module::ParamId> {
         let mut v = vec![self.classifier.weight.id];
