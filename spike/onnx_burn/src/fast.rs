@@ -502,13 +502,22 @@ pub fn fit_expr_staged<B: AutodiffBackend>(
     let (b_lr_head, b_lr_bb) = (2e-4 * scale, 5e-5 * scale);
     let decay = 1.0 - 0.001 * (cfg.batch as f64 / 64.0); // per-step EMA decay (config EXPR_EMA_DECAY)
 
-    let w = Arc::new(Weighted::expr(&samples, train, 4.0));
-    let pools = Arc::new(Pools::expr_build(&samples, train));
+    // Exclude FLAG_EXPR_UNLABELED (free-expression gaze-section) frames from expr supervision, pairing,
+    // and validation — their labels are a FAKE neutral, so supervising toward them pulls the active
+    // channels (esp. brow) to 0 and inflates val MSE with easy neutrals (mirrors the reference frontend's
+    // exclude_expr_unlabeled=True for train/val/paired). They remain the unlabeled MT/temporal stream and
+    // stay in the gaze buckets (both keyed on expr_unlabeled directly).
+    let train_e: Vec<usize> = train.iter().cloned().filter(|&i| samples[i].expr_unlabeled < 0.5).collect();
+    let val_e: Vec<usize> = val.iter().cloned().filter(|&i| samples[i].expr_unlabeled < 0.5).collect();
+    let val_e: &[usize] = if val_e.is_empty() { val } else { &val_e };
+
+    let w = Arc::new(Weighted::expr(&samples, &train_e, 4.0));
+    let pools = Arc::new(Pools::expr_build(&samples, &train_e));
     let rx = spawn_prefetch(frames.clone(), samples.clone(), w, cfg.batch, cfg.workers, true, 0xE47, pools);
 
     // Paired-eye stream for evenness (both stages) + consensus (stage B). pbatch = batch/2 (reference
     // EXPR_EVEN_BATCH). Falls back to expr-only if the capture has no records with both eyes valid.
-    let paired = Arc::new(Paired::build(&samples, train));
+    let paired = Arc::new(Paired::build(&samples, &train_e));
     let do_paired = !paired.is_empty();
     let pbatch = (cfg.batch / 2).max(1);
     let prx = do_paired.then(|| {
@@ -527,7 +536,7 @@ pub fn fit_expr_staged<B: AutodiffBackend>(
     if load_pretrained_expr(&mut model) {
         model.small_init_head(device); // reference re-inits the head small after loading the backbone
     }
-    let head_ids = model.head_ids();
+    let mut head_ids = model.head_ids();
     let mut opt_head = AdamWConfig::new().with_weight_decay(cfg.wd).init();
     let mut opt_bb = AdamWConfig::new().with_weight_decay(cfg.wd).init();
     // Consensus heads (feat_dim = classifier input = 1280); trained in stage B on detached teacher feats.
@@ -561,7 +570,24 @@ pub fn fit_expr_staged<B: AutodiffBackend>(
             (b_lr_head * cos(p), b_lr_bb * cos(p), false, 1)
         };
         if stage_b && step == a_steps {
-            teacher = model.valid(); // fresh teacher at stage B (matches reference EMATeacher reset)
+            // Reference stage-B init (fit_expr_stages: fit_expr(pretrained=False, init=a_ckpt)): warm-start
+            // the student from the stage-A BEST teacher (warm_start_from prefers the "teacher" tensors,
+            // which is exactly what we saved to `ckpt`), with a FRESH optimizer, a fresh EMA teacher, and a
+            // reset best tracker so the exported model is always the stage-B best (never a stage-A ckpt with
+            // no consensus/MT training). Falls back to the current weights if no stage-A ckpt was written.
+            let rec = NamedMpkFileRecorder::<FullPrecisionSettings>::new();
+            match Mnv4::<B>::new(T, 4, device).load_file(ckpt, &rec, device) {
+                Ok(m) => {
+                    model = m;
+                    head_ids = model.head_ids(); // param ids may change on load; keep the head/bb split valid
+                    println!("[expr B] warm-started from stage-A best ({ckpt})");
+                }
+                Err(e) => println!("[expr B] no stage-A ckpt to warm-start ({e}); continuing from last"),
+            }
+            opt_head = AdamWConfig::new().with_weight_decay(cfg.wd).init();
+            opt_bb = AdamWConfig::new().with_weight_decay(cfg.wd).init();
+            teacher = model.valid();
+            best = f32::INFINITY;
         }
 
         // One student forward over the concatenated mega-batch (matches reference xcat): the supervised
@@ -702,10 +728,13 @@ pub fn fit_expr_staged<B: AutodiffBackend>(
             }
             win = Instant::now();
         }
-        if step % cfg.val_every == 0 || step == cfg.steps - 1 {
+        // Eval on val_e (fake-neutral frames excluded). Include step a_steps-1 so the stage-A BEST
+        // reflects end-of-stage-A before the stage-B warm-start reload (mirrors the reference's per-stage
+        // `step == steps-1` eval; our loop is one continuous range so we add the boundary explicitly).
+        if step % cfg.val_every == 0 || step == cfg.steps - 1 || step == a_steps - 1 {
             let keep = decay.powi(ema_every as i32) as f32;
             teacher = ema_update::<B::InnerBackend, _>(teacher, &model.valid(), keep);
-            let (mse, r) = eval_expr(&teacher, &frames, &samples, val, device);
+            let (mse, r) = eval_expr(&teacher, &frames, &samples, val_e, device);
             let tag = if mse < best { "*" } else { "" };
             let st = if stage_b { "B" } else { "A" };
             println!("[expr {st} {step:5}/{}] mse={mse:.5} r({:.3} {:.3} {:.3} {:.3}) {tag}", cfg.steps, r[0], r[1], r[2], r[3]);
