@@ -4,6 +4,7 @@ pub mod ema;
 pub mod eval;
 pub mod export;
 pub mod fast;
+pub mod flat_opt;
 pub mod gaze;
 pub mod heads;
 pub mod losses;

@@ -18,6 +18,7 @@ use rayon::prelude::*;
 use crate::aug;
 use crate::data::{process_eye, Bin, Sample, S, T};
 use crate::ema::ema_update;
+use crate::flat_opt::{Filter, FlatAdamW, FlatEma};
 use crate::gaze::MicroChad;
 use crate::heads::ConsensusHeads;
 use crate::losses::{consensus_term, evenness, mt_consistency, supervised_deconfuse, temporal, ExprConsts};
@@ -528,6 +529,12 @@ pub fn fit_expr_staged<B: AutodiffBackend>(
     let bn_ids: HashSet<ParamId> = model.running_state_ids().into_iter().collect();
     let mut opt_head = AdamWConfig::new().with_weight_decay(cfg.wd).init();
     let mut opt_bb = AdamWConfig::new().with_weight_decay(cfg.wd).init();
+    // BB_FLAT_OPT=1: fused multi-tensor AdamW+EMA (flat arenas; numerically identical, wgpu-only).
+    let flat_on = std::env::var("BB_FLAT_OPT").ok().as_deref() == Some("1");
+    let head_set: HashSet<ParamId> = head_ids.iter().copied().collect();
+    let mut f_head = FlatAdamW::<B::InnerBackend>::new(cfg.wd, Filter::Include(head_set.clone()));
+    let mut f_bb = FlatAdamW::<B::InnerBackend>::new(cfg.wd, Filter::Exclude(head_set));
+    let mut f_ema = FlatEma::<B::InnerBackend>::new();
     // Consensus heads (feat_dim = classifier input = 1280); trained in stage B on detached teacher feats.
     let mut cons = ConsensusHeads::<B>::new(1280, device);
     let mut opt_cons = AdamWConfig::new().with_weight_decay(cfg.wd).init();
@@ -566,6 +573,7 @@ pub fn fit_expr_staged<B: AutodiffBackend>(
         };
         if stage_b && step == a_steps {
             teacher = model.valid(); // fresh teacher at stage B (matches reference EMATeacher reset)
+            f_ema.reset(); // flat arena re-captured from the fresh teacher on next update
             if do_paired {
                 // The deployed 15-dim model fuses brow to the consensus head, which ONLY trains in
                 // stage B. Reset best so the exported checkpoint is selected from stage B, pairing the
@@ -703,9 +711,17 @@ pub fn fit_expr_staged<B: AutodiffBackend>(
         let t0 = Instant::now();
         let head_gp = GradientsParams::from_params(&mut grads, &model, &head_ids);
         let bb_gp = GradientsParams::from_module(&mut grads, &model); // remaining = backbone
-        model = opt_head.step(lr_head, model, head_gp);
-        if !frozen {
-            model = opt_bb.step(lr_bb, model, bb_gp);
+        if flat_on {
+            f_bb.ensure_init(&model, &bb_gp); // frozen steps too: the flat EMA needs the bb arena
+            model = f_head.step(lr_head, model, head_gp);
+            if !frozen {
+                model = f_bb.step(lr_bb, model, bb_gp);
+            }
+        } else {
+            model = opt_head.step(lr_head, model, head_gp);
+            if !frozen {
+                model = opt_bb.step(lr_bb, model, bb_gp);
+            }
         }
         if cons_step {
             let cons_gp = GradientsParams::from_module(&mut grads, &cons);
@@ -717,7 +733,11 @@ pub fn fit_expr_staged<B: AutodiffBackend>(
         let t0 = Instant::now();
         if step % ema_every == 0 {
             let keep = decay.powi(ema_every as i32) as f32;
-            teacher = ema_update::<B::InnerBackend, _>(teacher, &model.valid(), keep, &bn_ids);
+            teacher = if flat_on {
+                f_ema.update(teacher, &model.valid(), &[&f_head, &f_bb], keep, &bn_ids)
+            } else {
+                ema_update::<B::InnerBackend, _>(teacher, &model.valid(), keep, &bn_ids)
+            };
         }
         psync(micro);
         pt[6] += t0.elapsed().as_secs_f32();
