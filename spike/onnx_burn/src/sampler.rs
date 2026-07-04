@@ -26,6 +26,9 @@ impl Rng {
 // representative of all routine sections while only block boundaries touch train. seed offsets which
 // blocks are held out.
 pub fn split(n: usize, val_frac: f32, seed: u64) -> (Vec<usize>, Vec<usize>) {
+    if n == 0 {
+        return (Vec::new(), Vec::new()); // guard: n-1 below would underflow
+    }
     let bsize = 64usize; // small contiguous blocks: val spread finely over the timeline (representative
                          // of every routine section) while only block edges touch train (~minimal leak)
     let stride = (1.0 / val_frac).round().max(2.0) as usize; // hold every stride-th block (~10 for 0.1)
@@ -36,6 +39,26 @@ pub fn split(n: usize, val_frac: f32, seed: u64) -> (Vec<usize>, Vec<usize>) {
     }
     if val.is_empty() {
         val.push(n - 1);
+    }
+    (train, val)
+}
+
+// Same contiguous-block holdout as split(), but blocked on the RECORD index so BOTH eyes of a record
+// always land on the same side — an eye can't train while its mirror validates (the interleaved
+// per-eye split leaked at block edges / single-eye records). samples appear in increasing rec order.
+pub fn split_by_record(samples: &[Sample], val_frac: f32, seed: u64) -> (Vec<usize>, Vec<usize>) {
+    if samples.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+    let bsize = 64usize; // records per block
+    let stride = (1.0 / val_frac).round().max(2.0) as usize;
+    let off = (seed as usize) % stride;
+    let (mut train, mut val) = (Vec::new(), Vec::new());
+    for (i, s) in samples.iter().enumerate() {
+        if (s.rec / bsize) % stride == off { val.push(i) } else { train.push(i) }
+    }
+    if val.is_empty() {
+        val.push(samples.len() - 1);
     }
     (train, val)
 }

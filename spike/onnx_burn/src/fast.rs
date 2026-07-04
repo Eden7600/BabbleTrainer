@@ -737,15 +737,18 @@ pub fn fit_expr_staged<B: AutodiffBackend>(
             win = Instant::now();
         }
         if step % cfg.val_every == 0 || step == cfg.steps - 1 {
+            // Fold the latest student into a TEMPORARY teacher for eval/deploy, without committing it —
+            // so val_every no longer perturbs the persistent EMA trajectory (BUGS #7: was a committed
+            // fold on top of the scheduled one). The persistent `teacher` keeps its own stride.
             let keep = decay.powi(ema_every as i32) as f32;
-            teacher = ema_update::<B::InnerBackend, _>(teacher, &model.valid(), keep, &bn_ids);
-            let (mse, r) = eval_expr(&teacher, &frames, &samples, val, device);
+            let eval_teacher = ema_update::<B::InnerBackend, _>(teacher.clone(), &model.valid(), keep, &bn_ids);
+            let (mse, r) = eval_expr(&eval_teacher, &frames, &samples, val, device);
             // In stage B the deployed model is the fused 15-dim output, so select on main-head MSE PLUS
             // the consensus (widen/squint/brow) val MSE. This refuses the first stage-B step (consensus
             // near-init -> flat, high cons MSE) in favor of one where the consensus has actually trained,
             // and saves the teacher + same-step consensus together (BUGS #1). Both are MSE in [0,1].
             let cons_mse = if stage_b && do_paired {
-                eval_consensus(&teacher, &cons.valid(), &frames, &paired_val, device)
+                eval_consensus(&eval_teacher, &cons.valid(), &frames, &paired_val, device)
             } else {
                 0.0
             };
@@ -756,7 +759,7 @@ pub fn fit_expr_staged<B: AutodiffBackend>(
             if score < best {
                 best = score;
                 let rec = NamedMpkFileRecorder::<FullPrecisionSettings>::new();
-                teacher.clone().save_file(ckpt, &rec).unwrap();
+                eval_teacher.save_file(ckpt, &rec).unwrap();
                 if stage_b && do_paired {
                     cons.clone().save_file(&cons_ckpt, &rec).unwrap();
                 }

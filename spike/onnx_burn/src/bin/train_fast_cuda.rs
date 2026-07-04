@@ -5,7 +5,7 @@ use std::time::Instant;
 use burn::backend::{Autodiff, Cuda};
 use onnx_burn::data::parse_bin;
 use onnx_burn::fast::{build_samples, fit_expr_staged, fit_gaze_fast, FastCfg, Frames};
-use onnx_burn::sampler::split;
+use onnx_burn::sampler::split_by_record;
 
 type AB = Autodiff<Cuda>;
 
@@ -24,7 +24,7 @@ fn main() {
     println!("parallel-decoded {} eyes in {:.1}s", bin.frames.len() * 2, t.elapsed().as_secs_f32());
     let samples = Arc::new(build_samples(&bin, &frames));
     println!("{} eye-samples", samples.len());
-    let (train, val) = split(samples.len(), 0.1, 1234);
+    let (train, val) = split_by_record(&samples, 0.1, 1234);
 
     let (frames_g, samples_g, train_g, val_g) = (frames.clone(), samples.clone(), train.clone(), val.clone());
     let gaze_h = std::thread::spawn(move || {

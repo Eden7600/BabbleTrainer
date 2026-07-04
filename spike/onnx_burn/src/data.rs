@@ -81,10 +81,10 @@ pub fn parse_bin(path: &str) -> std::io::Result<Bin> {
     Ok(Bin { bytes, frames })
 }
 
-fn decode_gray(buf: &[u8]) -> Option<Vec<u8>> {
-    image::load_from_memory_with_format(buf, image::ImageFormat::Jpeg)
-        .ok()
-        .map(|im| im.to_luma8().into_raw())
+fn decode_gray(buf: &[u8]) -> Option<(Vec<u8>, usize, usize)> {
+    let im = image::load_from_memory_with_format(buf, image::ImageFormat::Jpeg).ok()?;
+    let (w, h) = (im.width() as usize, im.height() as usize);
+    Some((im.to_luma8().into_raw(), w, h))
 }
 
 fn std_dev(px: &[u8]) -> f32 {
@@ -139,14 +139,14 @@ fn flip_h(px: &mut [u8]) {
 pub fn process_eye(bin: &Bin, rec: usize, side: usize) -> Option<Vec<u8>> {
     let fr = &bin.frames[rec];
     let (start, len) = if side == 0 { (fr.off, fr.jl) } else { (fr.off + fr.jl, fr.jr) };
-    let raw = decode_gray(&bin.bytes[start..start + len])?;
+    let (raw, w, h) = decode_gray(&bin.bytes[start..start + len])?;
     // is_blank on the pre-resize decoded pixels (std < 2.0)
     if std_dev(&raw) < 2.0 {
         return None;
     }
-    // decoded is (h,w); this capture is square 128. Guard non-128 with a resize.
-    let side_len = (raw.len() as f64).sqrt() as usize;
-    let mut img = area_resize_to_s(&raw, side_len, side_len);
+    // Resize from the REAL decoded dims to 128x128 (non-square eye crops on other headsets no longer
+    // panic or shear — was reconstructed as sqrt(len), which assumed a square).
+    let mut img = area_resize_to_s(&raw, w, h);
     equalize_hist(&mut img);
     if side == MIRROR_SIDE {
         flip_h(&mut img);
