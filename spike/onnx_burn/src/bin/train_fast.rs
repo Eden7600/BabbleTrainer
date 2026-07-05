@@ -114,13 +114,14 @@ fn main() {
 
     // ---- VRAM policy ----------------------------------------------------------------------
     // Budget = BB_VRAM_MB if set, else measured free VRAM minus headroom, else a conservative
-    // 2500 MB. The ladder picks the fastest configuration that fits (training must coexist with
-    // VRChat on the user's GPU — never assume the card is ours):
-    //   budget >= frames + ~2500 -> resident GPU aug            (fastest)
-    //   budget >= ~1800          -> per-step GPU aug            (same kernels, ~5 MB/step)
-    //   below                    -> per-step + sequential expr->gaze on one device
-    // BB_POOL_MB (default 64, 0=off) caps the cubecl pools; BB_SEQ=0|1 / BB_GPU_AUG override.
-    let frames_mb_est = 800u64; // refined below after decode; only used for the tier print
+    // 2500 MB. Ladder thresholds are MEASURED on a 3060 (full 4000/3200 run, pools capped):
+    //   FAST  concurrent + resident frame store   peak 5438 MiB   8m58s
+    //   MID   concurrent + per-step frame upload  peak 4725 MiB   8m52s
+    //   LOW   sequential + per-step               peak 3380 MiB   8m48s  (32 MB pool pages)
+    // Wall time is FLAT across tiers here (expr is host-bound; gaze concurrency buys nothing),
+    // so the ladder only opts up where spare VRAM makes the resident store / dual device free.
+    // Training must coexist with VRChat on the user's GPU — never assume the card is ours.
+    // BB_POOL_MB (default 32, 0=off) caps the cubecl pools; BB_SEQ=0|1 / BB_GPU_AUG override.
     let headroom = 700u64;
     let budget_mb: u64 = std::env::var("BB_VRAM_MB").ok().and_then(|v| v.parse().ok()).unwrap_or_else(|| {
         match free_vram_mb() {
@@ -131,15 +132,15 @@ fn main() {
     let seq = match std::env::var("BB_SEQ").ok().as_deref() {
         Some("1") => true,
         Some("0") => false,
-        _ => budget_mb < 1800,
+        _ => budget_mb < 4900, // below the measured MID peak: one device, one pool set
     };
     if std::env::var("BB_GPU_AUG").is_err() && std::env::var("BB_VRAM_MB").is_err() {
-        // fast.rs auto-tier compares the frame store against BB_VRAM_MB: give it the part of the
-        // budget not needed by training itself (~2.5 GB live across both streams).
-        let store_budget = budget_mb.saturating_sub(2500);
+        // fast.rs auto-tier compares the frame store against BB_VRAM_MB: hand it the budget left
+        // after the measured non-store training footprint (~4.7 GB concurrent w/ pools).
+        let store_budget = budget_mb.saturating_sub(4700);
         unsafe { std::env::set_var("BB_VRAM_MB", store_budget.to_string()) };
     }
-    let pool_mb: u64 = std::env::var("BB_POOL_MB").ok().and_then(|v| v.parse().ok()).unwrap_or(64);
+    let pool_mb: u64 = std::env::var("BB_POOL_MB").ok().and_then(|v| v.parse().ok()).unwrap_or(32);
     if pool_mb > 0 {
         init_setup::<AutoGraphicsApi>(&WgpuDevice::DefaultDevice, pool_opts(pool_mb));
         if !seq && std::env::var("BB_SHARED_DEV").ok().as_deref() != Some("1") {
@@ -147,7 +148,7 @@ fn main() {
         }
     }
     println!(
-        "[vram] budget {budget_mb} MB (frames est ~{frames_mb_est} MB) -> {} | pools {}",
+        "[vram] budget {budget_mb} MB -> {} | pools {}",
         if seq { "SEQUENTIAL expr->gaze, shared device" } else { "concurrent expr+gaze" },
         if pool_mb > 0 { format!("capped @ {pool_mb} MB pages") } else { "default".into() },
     );
