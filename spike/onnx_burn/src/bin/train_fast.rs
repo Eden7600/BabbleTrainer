@@ -81,7 +81,14 @@ fn main() {
     let gaze_h = (only != "expr").then(|| {
         let (frames_g, samples_g, train_g, val_g) = (frames.clone(), samples.clone(), train.clone(), val.clone());
         std::thread::spawn(move || {
-            let device = Default::default();
+            // Own logical wgpu device (distinct cubecl server + queue on the same GPU): expr and
+            // gaze encode/submit in parallel instead of serializing on one device server.
+            // BB_SHARED_DEV=1 reverts to the shared default device.
+            let device = if std::env::var("BB_SHARED_DEV").ok().as_deref() == Some("1") {
+                Default::default()
+            } else {
+                burn::backend::wgpu::WgpuDevice::DiscreteGpu(0)
+            };
             fit_gaze_fast::<AB>(
                 frames_g, samples_g, &train_g, &val_g,
                 &FastCfg { steps: gs, batch: 64, warmup: gs / 10, val_every: (gs / 4).max(1), lr: 1e-3, wd: 1e-2, workers: 2 },

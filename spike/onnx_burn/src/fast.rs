@@ -521,6 +521,116 @@ pub fn fit_expr_staged<B: AutodiffBackend>(
     let urx = do_unlab.then(|| spawn_unlabeled_prefetch(frames.clone(), unlab.clone(), present.clone(), ub, cfg.workers, 0x51A9));
     println!("[expr] paired={} ({} recs) unlabeled={} ({} frames)", do_paired, paired.recs.len(), do_unlab, unlab.items.len());
 
+    // Assembler thread: receives the three prefetch streams, concatenates the mega-batch + packed
+    // labels, and uploads BOTH tensors to the device off the critical thread (double-buffered).
+    struct StepBatch<BI: Backend> {
+        big_i: Tensor<BI, 4>,
+        lbl: Tensor<BI, 1>,
+        y_end: usize,
+        off_pl: usize,
+        off_pr: usize,
+        off_cs: usize,
+        off_cw: usize,
+        off_nw: usize,
+        pll_off: usize,
+        prl_off: usize,
+        ok_off: usize,
+        has_paired: bool,
+        has_unlab: bool,
+    }
+    let arx = {
+        let (atx, arx) = sync_channel::<StepBatch<B::InnerBackend>>(2);
+        let adev = device.clone();
+        let batch = cfg.batch;
+        thread::spawn(move || {
+            for step in 0.. {
+                let stage_b = step >= a_steps;
+                let (mut sdata, ys) = match rx.recv() {
+                    Ok(b) => b,
+                    Err(_) => break,
+                };
+                let mut rows = batch;
+                let paired_b = prx.as_ref().map(|p| p.recv().unwrap());
+                let (mut off_pl, mut off_pr) = (0usize, 0usize);
+                if let Some((pld, prd, _, _)) = &paired_b {
+                    off_pl = rows;
+                    sdata.extend_from_slice(pld);
+                    rows += pbatch;
+                    off_pr = rows;
+                    sdata.extend_from_slice(prd);
+                    rows += pbatch;
+                }
+                let unlab_b = if stage_b { urx.as_ref().map(|u| u.recv().unwrap()) } else { None };
+                let (mut off_cs, mut off_cw, mut off_nw) = (0usize, 0usize, 0usize);
+                if let Some((cs, cw, nw, _)) = &unlab_b {
+                    off_cs = rows;
+                    sdata.extend_from_slice(cs);
+                    rows += ub;
+                    off_cw = rows;
+                    sdata.extend_from_slice(cw);
+                    rows += ub;
+                    off_nw = rows;
+                    sdata.extend_from_slice(nw);
+                    rows += ub;
+                }
+                // Pack ALL labels (supervised y, paired pll/prl, temporal pair_ok) into one buffer,
+                // one h2d, sliced on-device (OPT #12). Offsets are in ELEMENTS.
+                let mut lbl = ys;
+                let y_end = lbl.len();
+                let (mut pll_off, mut prl_off, mut ok_off) = (0usize, 0usize, 0usize);
+                if let Some((_, _, plld, prld)) = &paired_b {
+                    pll_off = lbl.len();
+                    lbl.extend_from_slice(plld);
+                    prl_off = lbl.len();
+                    lbl.extend_from_slice(prld);
+                }
+                if let Some((_, _, _, ok)) = &unlab_b {
+                    ok_off = lbl.len();
+                    lbl.extend_from_slice(ok);
+                }
+                let lbl_len = lbl.len();
+                let has_paired = paired_b.is_some();
+                let has_unlab = unlab_b.is_some();
+                let lbl = Tensor::<B::InnerBackend, 1>::from_data(TensorData::new(lbl, [lbl_len]), &adev);
+                // Upload in per-stream chunks and cat on-device: shorter client-lock holds, so the
+                // training thread's dispatches interleave instead of stalling behind one 42MB write.
+                let mut segs: Vec<Tensor<B::InnerBackend, 4>> = Vec::new();
+                let mut off = 0usize;
+                let plan = [batch, pbatch, pbatch, ub, ub, ub];
+                let mut planned = 0usize;
+                for (k, &n) in plan.iter().enumerate() {
+                    let present = match k {
+                        0 => true,
+                        1 | 2 => has_paired,
+                        _ => has_unlab,
+                    };
+                    if !present {
+                        continue;
+                    }
+                    let elems = n * T * S * S;
+                    let part: Vec<f32> = sdata[off..off + elems].to_vec();
+                    segs.push(Tensor::from_data(TensorData::new(part, [n, T, S, S]), &adev));
+                    off += elems;
+                    planned += n;
+                }
+                debug_assert_eq!(planned, rows);
+                let big_i = if segs.len() == 1 {
+                    segs.pop().unwrap()
+                } else {
+                    Tensor::cat(segs, 0)
+                };
+                let sb = StepBatch {
+                    big_i, lbl, y_end, off_pl, off_pr, off_cs, off_cw, off_nw,
+                    pll_off, prl_off, ok_off, has_paired, has_unlab,
+                };
+                if atx.send(sb).is_err() {
+                    break;
+                }
+            }
+        });
+        arx
+    };
+
     let mut model = Mnv4::<B>::new(T, 4, device);
     if load_pretrained_expr(&mut model) {
         model.small_init_head(device); // reference re-inits the head small after loading the backbone
@@ -583,60 +693,19 @@ pub fn fit_expr_staged<B: AutodiffBackend>(
             }
         }
 
-        // One student forward over the concatenated mega-batch (matches reference xcat): the supervised
-        // batch, the paired eyes (evenness), and the stage-B unlabeled strong/weak/neighbor views
-        // (mean-teacher + temporal). Auxiliary streams cost forward rows but never touch the regime.
+        // Mega-batch assembly + h2d happen on the assembler thread (double-buffered); the critical
+        // thread just receives prebuilt device tensors and lifts them into autodiff (free ops).
         let t0 = Instant::now();
-        let (mut sdata, ys) = rx.recv().unwrap();
-        let mut rows = cfg.batch;
-
-        let paired_b = prx.as_ref().map(|p| p.recv().unwrap());
-        let (mut off_pl, mut off_pr) = (0usize, 0usize);
-        if let Some((pld, prd, _, _)) = &paired_b {
-            off_pl = rows;
-            sdata.extend_from_slice(pld);
-            rows += pbatch;
-            off_pr = rows;
-            sdata.extend_from_slice(prd);
-            rows += pbatch;
-        }
-        let unlab_b = if stage_b { urx.as_ref().map(|u| u.recv().unwrap()) } else { None };
-        let (mut off_cs, mut off_cw, mut off_nw) = (0usize, 0usize, 0usize);
-        if let Some((cs, cw, nw, _)) = &unlab_b {
-            off_cs = rows;
-            sdata.extend_from_slice(cs);
-            rows += ub;
-            off_cw = rows;
-            sdata.extend_from_slice(cw);
-            rows += ub;
-            off_nw = rows;
-            sdata.extend_from_slice(nw);
-            rows += ub;
-        }
-        // Pack ALL labels (supervised y, paired pll/prl, temporal pair_ok) into one host buffer so they
-        // upload in a single h2d and are sliced on-device (OPT #12). Offsets are in ELEMENTS.
-        let mut lbl = ys;
-        let y_end = lbl.len(); // cfg.batch * 4
-        let (mut pll_off, mut prl_off, mut ok_off) = (0usize, 0usize, 0usize);
-        if let Some((_, _, plld, prld)) = &paired_b {
-            pll_off = lbl.len();
-            lbl.extend_from_slice(plld);
-            prl_off = lbl.len();
-            lbl.extend_from_slice(prld);
-        }
-        if let Some((_, _, _, ok)) = &unlab_b {
-            ok_off = lbl.len();
-            lbl.extend_from_slice(ok);
-        }
-        let lbl_len = lbl.len();
+        let sb = arx.recv().unwrap();
         pt[0] += t0.elapsed().as_secs_f32();
 
         let t0 = Instant::now();
-        let lbl_t = Tensor::<B, 1>::from_data(TensorData::new(lbl, [lbl_len]), device);
-        let y = lbl_t.clone().slice([0..y_end]).reshape([cfg.batch, 4]);
-        // Upload the mega-batch ONCE as an inner (non-autodiff) tensor; the student consumes it via
-        // from_inner (inputs need no grad) and the teacher slices it directly — no duplicate h2d.
-        let big_i = Tensor::<B::InnerBackend, 4>::from_data(TensorData::new(sdata, [rows, T, S, S]), device);
+        let (off_pl, off_pr) = (sb.off_pl, sb.off_pr);
+        let (off_cs, off_cw, off_nw) = (sb.off_cs, sb.off_cw, sb.off_nw);
+        let (pll_off, prl_off, ok_off) = (sb.pll_off, sb.prl_off, sb.ok_off);
+        let lbl_t = Tensor::<B, 1>::from_inner(sb.lbl);
+        let y = lbl_t.clone().slice([0..sb.y_end]).reshape([cfg.batch, 4]);
+        let big_i = sb.big_i;
         psync(micro);
         pt[1] += t0.elapsed().as_secs_f32();
 
@@ -650,14 +719,14 @@ pub fn fit_expr_staged<B: AutodiffBackend>(
         // ONE folded teacher inference pass over every row that needs teacher features (pl, pr, cw),
         // kept on-device: from_inner lifts the results into autodiff as constant leaves (detached),
         // so grads still flow only into the consensus heads / student — no host readback.
-        let need_pair_feats = stage_b && paired_b.is_some();
-        let tfeats = if need_pair_feats || unlab_b.is_some() {
+        let need_pair_feats = stage_b && sb.has_paired;
+        let tfeats = if need_pair_feats || sb.has_unlab {
             let mut segs: Vec<Tensor<B::InnerBackend, 4>> = Vec::with_capacity(3);
             if need_pair_feats {
                 segs.push(big_i.clone().slice([off_pl..off_pl + pbatch]));
                 segs.push(big_i.clone().slice([off_pr..off_pr + pbatch]));
             }
-            if unlab_b.is_some() {
+            if sb.has_unlab {
                 segs.push(big_i.clone().slice([off_cw..off_cw + ub]));
             }
             Some(teacher.forward_features(Tensor::cat(segs, 0)))
@@ -668,7 +737,7 @@ pub fn fit_expr_staged<B: AutodiffBackend>(
 
         // Evenness (both stages) + consensus (stage B) on the paired eyes.
         let mut cons_step = false;
-        if paired_b.is_some() {
+        if sb.has_paired {
             let out_pl = out.clone().slice([off_pl..off_pl + pbatch]);
             let out_pr = out.clone().slice([off_pr..off_pr + pbatch]);
             let pll = lbl_t.clone().slice([pll_off..pll_off + pbatch * 4]).reshape([pbatch, 4]);
@@ -689,7 +758,7 @@ pub fn fit_expr_staged<B: AutodiffBackend>(
 
         // Mean-teacher (strong<->weak consistency, quadratic ramp) + temporal smoothness (adjacent
         // frames within margin), stage B, on the unlabeled in-domain stream.
-        if unlab_b.is_some() {
+        if sb.has_unlab {
             let cs_out = out.clone().slice([off_cs..off_cs + ub]);
             let cw_out = out.clone().slice([off_cw..off_cw + ub]);
             let nw_out = out.clone().slice([off_nw..off_nw + ub]);
