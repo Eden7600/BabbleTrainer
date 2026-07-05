@@ -48,7 +48,9 @@ fn pool_opts(page_mb: u64) -> RuntimeOptions {
     }
 }
 
-// Free VRAM right now, in MB (NVIDIA only; other vendors return None and we use BB_VRAM_MB/default).
+// Free VRAM right now, in MB (NVIDIA only). Unused since LOW became the pegged default; kept for
+// re-benchmarking the tier ladder on faster GPUs.
+#[allow(dead_code)]
 fn free_vram_mb() -> Option<u64> {
     let out = std::process::Command::new("nvidia-smi")
         .args(["--query-gpu=memory.free", "--format=csv,noheader,nounits"])
@@ -113,32 +115,20 @@ fn main() {
     let workers: usize = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(6);
 
     // ---- VRAM policy ----------------------------------------------------------------------
-    // Budget = BB_VRAM_MB if set, else measured free VRAM minus headroom, else a conservative
-    // 2500 MB. Ladder thresholds are MEASURED on a 3060 (full 4000/3200 run, pools capped):
+    // DEFAULT = LOW tier, always. Measured on a 3060 (full 4000/3200 run, pools capped):
     //   FAST  concurrent + resident frame store   peak 5438 MiB   8m58s
     //   MID   concurrent + per-step frame upload  peak 4725 MiB   8m52s
     //   LOW   sequential + per-step               peak 3380 MiB   8m48s  (32 MB pool pages)
-    // Wall time is FLAT across tiers here (expr is host-bound; gaze concurrency buys nothing),
-    // so the ladder only opts up where spare VRAM makes the resident store / dual device free.
-    // Training must coexist with VRChat on the user's GPU — never assume the card is ours.
-    // BB_POOL_MB (default 32, 0=off) caps the cubecl pools; BB_SEQ=0|1 / BB_GPU_AUG override.
-    let headroom = 700u64;
-    let budget_mb: u64 = std::env::var("BB_VRAM_MB").ok().and_then(|v| v.parse().ok()).unwrap_or_else(|| {
-        match free_vram_mb() {
-            Some(f) => f.saturating_sub(headroom),
-            None => 2500,
-        }
-    });
-    let seq = match std::env::var("BB_SEQ").ok().as_deref() {
-        Some("1") => true,
-        Some("0") => false,
-        _ => budget_mb < 4900, // below the measured MID peak: one device, one pool set
-    };
+    // Wall time is FLAT across tiers (expr is host-bound; gaze concurrency buys nothing), so
+    // higher tiers spend VRAM for zero speed — LOW strictly dominates, and it must coexist with
+    // VRChat on the user's GPU. Overrides for experiments / future GPUs where expr goes
+    // GPU-bound and concurrency might pay: BB_SEQ=0 (concurrent, dual device), BB_GPU_AUG=1
+    // (resident store), BB_VRAM_MB (store-fits budget for fast.rs auto), BB_POOL_MB (default
+    // 32, 0 = uncapped cubecl defaults). Re-benchmark the ladder on a 5090 before revisiting.
+    let seq = std::env::var("BB_SEQ").ok().as_deref() != Some("0");
     if std::env::var("BB_GPU_AUG").is_err() && std::env::var("BB_VRAM_MB").is_err() {
-        // fast.rs auto-tier compares the frame store against BB_VRAM_MB: hand it the budget left
-        // after the measured non-store training footprint (~4.7 GB concurrent w/ pools).
-        let store_budget = budget_mb.saturating_sub(4700);
-        unsafe { std::env::set_var("BB_VRAM_MB", store_budget.to_string()) };
+        // fast.rs picks resident iff the frame store fits BB_VRAM_MB: 0 = always per-step.
+        unsafe { std::env::set_var("BB_VRAM_MB", "0") };
     }
     let pool_mb: u64 = std::env::var("BB_POOL_MB").ok().and_then(|v| v.parse().ok()).unwrap_or(32);
     if pool_mb > 0 {
@@ -148,8 +138,8 @@ fn main() {
         }
     }
     println!(
-        "[vram] budget {budget_mb} MB -> {} | pools {}",
-        if seq { "SEQUENTIAL expr->gaze, shared device" } else { "concurrent expr+gaze" },
+        "[vram] {} | pools {}",
+        if seq { "LOW tier: sequential expr->gaze, shared device" } else { "concurrent expr+gaze (BB_SEQ=0)" },
         if pool_mb > 0 { format!("capped @ {pool_mb} MB pages") } else { "default".into() },
     );
 
