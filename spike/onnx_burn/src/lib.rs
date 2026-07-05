@@ -6,6 +6,7 @@ pub mod export;
 pub mod fast;
 pub mod flat_opt;
 pub mod gaze;
+pub mod gpu_aug;
 pub mod heads;
 pub mod losses;
 pub mod mnv4;

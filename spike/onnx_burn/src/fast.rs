@@ -52,6 +52,19 @@ impl Frames {
         self.stack_into(rec, side, &mut out);
         out
     }
+    pub fn raw(&self) -> &[Option<Vec<u8>>] {
+        &self.data
+    }
+    // Temporal-stack frame ids for gpu_aug (+1-shifted, 0 = missing/blank), layout [rec*2+side].
+    fn stack_ids(&self, rec: usize, side: usize) -> [u32; T] {
+        let mut ids = [0u32; T];
+        for (k, id) in ids.iter_mut().enumerate() {
+            if rec >= k && self.get(rec - k, side).is_some() {
+                *id = ((rec - k) * 2 + side + 1) as u32;
+            }
+        }
+        ids
+    }
 }
 
 // Mixup source pools (expr only): neutral = max expr label < 0.2, expr = max expr label > 0.8, all =
