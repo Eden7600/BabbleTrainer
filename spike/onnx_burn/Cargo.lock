@@ -4693,6 +4693,9 @@ name = "onnx_burn"
 version = "0.1.0"
 dependencies = [
  "burn",
+ "burn-cubecl",
+ "burn-cubecl-fusion",
+ "burn-fusion",
  "burn-import",
  "burn-store",
  "image",
