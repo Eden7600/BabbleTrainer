@@ -157,6 +157,41 @@ pub struct GpuFrames<B: Backend> {
 pub trait AugBackend: Backend + Sized {
     fn aug_upload(data: &[Option<Vec<u8>>], device: &Self::Device) -> GpuFrames<Self>;
     fn aug_batch(frames: &GpuFrames<Self>, specs: &[AugSpec], device: &Self::Device) -> Tensor<Self, 4>;
+
+    // Low-VRAM tier: upload ONLY the frames this step references (deduped, ids remapped to a small
+    // per-step store, ~5 MB) instead of keeping the whole capture resident (~700 MB). Same kernels,
+    // same math — output is bit-identical to aug_batch on the resident store.
+    fn aug_batch_step(data: &[Option<Vec<u8>>], specs: &[AugSpec], device: &Self::Device) -> Tensor<Self, 4> {
+        let mut map: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
+        let mut uniq: Vec<u32> = Vec::new();
+        let mut local: Vec<AugSpec> = Vec::with_capacity(specs.len());
+        for sp in specs {
+            let mut s = sp.clone();
+            for id in s.ids_a.iter_mut().chain(s.ids_b.iter_mut()) {
+                if *id != 0 {
+                    *id = *map.entry(*id).or_insert_with(|| {
+                        uniq.push(*id);
+                        uniq.len() as u32
+                    });
+                }
+            }
+            local.push(s);
+        }
+        let mut buf: Vec<i32> = Vec::with_capacity((uniq.len() + 1) * W_FRAME);
+        buf.extend(std::iter::repeat(0i32).take(W_FRAME)); // sentinel zeros row
+        for &gid in &uniq {
+            match &data[(gid - 1) as usize] {
+                Some(px) => {
+                    for w in px.chunks_exact(4) {
+                        buf.push(i32::from_le_bytes([w[0], w[1], w[2], w[3]]));
+                    }
+                }
+                None => buf.extend(std::iter::repeat(0i32).take(W_FRAME)),
+            }
+        }
+        let packed = Tensor::from_data(TensorData::new(buf, [uniq.len() + 1, W_FRAME]), device);
+        Self::aug_batch(&GpuFrames { packed }, &local, device)
+    }
 }
 
 use burn::tensor::{DType, TensorPrimitive};
@@ -310,8 +345,14 @@ mod tests {
         let cpu5 = cpu_stack(&data, &ids3);
         let s5 = AugSpec::plain(ids3);
 
-        let out = <B as AugBackend>::aug_batch(&frames, &[s1, s2, s3, s4, s5], &device);
+        let specs = [s1, s2, s3, s4, s5];
+        let out = <B as AugBackend>::aug_batch(&frames, &specs, &device);
         let v = out.into_data().to_vec::<f32>().unwrap();
+
+        // Per-step tier must be BIT-identical to the resident store (same kernels, remapped ids).
+        let v2 = <B as AugBackend>::aug_batch_step(&data, &specs, &device).into_data().to_vec::<f32>().unwrap();
+        assert_eq!(v.len(), v2.len());
+        assert!(v.iter().zip(&v2).all(|(a, b)| a == b), "per-step tier diverged from resident store");
         let n = T * S * S;
         for (i, (name, cpu)) in [("strong", &cpu1), ("weak", &cpu2), ("mixup", &cpu3), ("gaze", &cpu4), ("plain", &cpu5)]
             .iter()

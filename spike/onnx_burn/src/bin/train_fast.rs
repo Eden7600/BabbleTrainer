@@ -2,12 +2,60 @@
 use std::sync::Arc;
 use std::time::Instant;
 
+use burn::backend::wgpu::{graphics::AutoGraphicsApi, init_setup, MemoryConfiguration, RuntimeOptions, WgpuDevice};
 use burn::backend::{Autodiff, Wgpu};
+use cubecl_runtime::memory_management::{MemoryPoolOptions, PoolType};
 use onnx_burn::data::{parse_bin, process_eye, S, T};
 use onnx_burn::fast::{build_samples, fit_expr_staged, fit_gaze_fast, FastCfg, Frames};
 use onnx_burn::sampler::{split_by_record, Rng};
 
 type AB = Autodiff<Wgpu>;
+
+const MB: u64 = 1024 * 1024;
+
+// Capped-pool memory config: the cubecl default (SubSlices) sizes its pages from
+// max_storage_buffer_binding_size (GBs) and NEVER deallocates them, so each device server holds
+// far more VRAM than its live tensors (measured: gaze holds ~2 GB for ~500 MB of need). Here:
+// small sliced pools sized to the actual working set, finite dealloc periods so idle pages are
+// returned, and an exclusive catch-all so big one-offs (e.g. the resident frame store) allocate
+// exactly-sized pages instead of pinning a giant sliced page.
+fn pool_opts(page_mb: u64) -> RuntimeOptions {
+    let page = page_mb * MB;
+    RuntimeOptions {
+        memory_config: MemoryConfiguration::Custom {
+            pool_options: vec![
+                MemoryPoolOptions { pool_type: PoolType::ExclusivePages { max_alloc_size: 0 }, dealloc_period: None },
+                MemoryPoolOptions {
+                    pool_type: PoolType::SlicedPages { page_size: page / 4, max_slice_size: page / 16 },
+                    dealloc_period: Some(4000),
+                },
+                MemoryPoolOptions {
+                    pool_type: PoolType::SlicedPages { page_size: page, max_slice_size: page },
+                    dealloc_period: Some(2000),
+                },
+                // Exclusive buckets for big allocations (activations, frame store): pages are
+                // sized ~to the request (NOT the bucket; a u64::MAX catch-all would try to
+                // allocate cur_avg_size = MAX/2 bytes on first use and poison the fusion stream),
+                // and idle pages are returned. Top bucket = 4 GB, the wgpu binding limit region.
+                MemoryPoolOptions { pool_type: PoolType::ExclusivePages { max_alloc_size: 128 * MB }, dealloc_period: Some(1000) },
+                MemoryPoolOptions { pool_type: PoolType::ExclusivePages { max_alloc_size: 256 * MB }, dealloc_period: Some(1000) },
+                MemoryPoolOptions { pool_type: PoolType::ExclusivePages { max_alloc_size: 512 * MB }, dealloc_period: Some(500) },
+                MemoryPoolOptions { pool_type: PoolType::ExclusivePages { max_alloc_size: 1024 * MB }, dealloc_period: Some(500) },
+                MemoryPoolOptions { pool_type: PoolType::ExclusivePages { max_alloc_size: 4096 * MB }, dealloc_period: Some(300) },
+            ],
+        },
+        ..Default::default()
+    }
+}
+
+// Free VRAM right now, in MB (NVIDIA only; other vendors return None and we use BB_VRAM_MB/default).
+fn free_vram_mb() -> Option<u64> {
+    let out = std::process::Command::new("nvidia-smi")
+        .args(["--query-gpu=memory.free", "--format=csv,noheader,nounits"])
+        .output()
+        .ok()?;
+    String::from_utf8_lossy(&out.stdout).lines().next()?.trim().parse().ok()
+}
 
 fn probe(bin_path: &str) {
     let bin = parse_bin(bin_path).expect("parse bin");
@@ -64,6 +112,46 @@ fn main() {
     let gs: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(3200);
     let workers: usize = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(6);
 
+    // ---- VRAM policy ----------------------------------------------------------------------
+    // Budget = BB_VRAM_MB if set, else measured free VRAM minus headroom, else a conservative
+    // 2500 MB. The ladder picks the fastest configuration that fits (training must coexist with
+    // VRChat on the user's GPU — never assume the card is ours):
+    //   budget >= frames + ~2500 -> resident GPU aug            (fastest)
+    //   budget >= ~1800          -> per-step GPU aug            (same kernels, ~5 MB/step)
+    //   below                    -> per-step + sequential expr->gaze on one device
+    // BB_POOL_MB (default 64, 0=off) caps the cubecl pools; BB_SEQ=0|1 / BB_GPU_AUG override.
+    let frames_mb_est = 800u64; // refined below after decode; only used for the tier print
+    let headroom = 700u64;
+    let budget_mb: u64 = std::env::var("BB_VRAM_MB").ok().and_then(|v| v.parse().ok()).unwrap_or_else(|| {
+        match free_vram_mb() {
+            Some(f) => f.saturating_sub(headroom),
+            None => 2500,
+        }
+    });
+    let seq = match std::env::var("BB_SEQ").ok().as_deref() {
+        Some("1") => true,
+        Some("0") => false,
+        _ => budget_mb < 1800,
+    };
+    if std::env::var("BB_GPU_AUG").is_err() && std::env::var("BB_VRAM_MB").is_err() {
+        // fast.rs auto-tier compares the frame store against BB_VRAM_MB: give it the part of the
+        // budget not needed by training itself (~2.5 GB live across both streams).
+        let store_budget = budget_mb.saturating_sub(2500);
+        unsafe { std::env::set_var("BB_VRAM_MB", store_budget.to_string()) };
+    }
+    let pool_mb: u64 = std::env::var("BB_POOL_MB").ok().and_then(|v| v.parse().ok()).unwrap_or(64);
+    if pool_mb > 0 {
+        init_setup::<AutoGraphicsApi>(&WgpuDevice::DefaultDevice, pool_opts(pool_mb));
+        if !seq && std::env::var("BB_SHARED_DEV").ok().as_deref() != Some("1") {
+            init_setup::<AutoGraphicsApi>(&WgpuDevice::DiscreteGpu(0), pool_opts(pool_mb));
+        }
+    }
+    println!(
+        "[vram] budget {budget_mb} MB (frames est ~{frames_mb_est} MB) -> {} | pools {}",
+        if seq { "SEQUENTIAL expr->gaze, shared device" } else { "concurrent expr+gaze" },
+        if pool_mb > 0 { format!("capped @ {pool_mb} MB pages") } else { "default".into() },
+    );
+
     let device = Default::default();
     println!("parsing {bin_path} ...");
     let bin = parse_bin(&bin_path).expect("parse bin");
@@ -78,7 +166,9 @@ fn main() {
     // two streams interleave on one device and gaze's wall hides under expr's.
     // BB_ONLY=expr|gaze isolates one stream (profiling: device syncs must not cross-pollute).
     let only = std::env::var("BB_ONLY").unwrap_or_default();
-    let gaze_h = (only != "expr").then(|| {
+    let gaze_cfg = FastCfg { steps: gs, batch: 64, warmup: gs / 10, val_every: (gs / 4).max(1), lr: 1e-3, wd: 1e-2, workers: 2 };
+    let gaze_cfg_t = gaze_cfg.clone();
+    let gaze_h = (only != "expr" && !seq).then(|| {
         let (frames_g, samples_g, train_g, val_g) = (frames.clone(), samples.clone(), train.clone(), val.clone());
         std::thread::spawn(move || {
             // Own logical wgpu device (distinct cubecl server + queue on the same GPU): expr and
@@ -89,22 +179,24 @@ fn main() {
             } else {
                 burn::backend::wgpu::WgpuDevice::DiscreteGpu(0)
             };
-            fit_gaze_fast::<AB>(
-                frames_g, samples_g, &train_g, &val_g,
-                &FastCfg { steps: gs, batch: 64, warmup: gs / 10, val_every: (gs / 4).max(1), lr: 1e-3, wd: 1e-2, workers: 2 },
-                &device, "../ckpt_gaze.mpk",
-            )
+            fit_gaze_fast::<AB>(frames_g, samples_g, &train_g, &val_g, &gaze_cfg_t, &device, "../ckpt_gaze.mpk")
         })
     });
     let e = if only != "gaze" {
         fit_expr_staged::<AB>(
-            frames, samples, &train, &val,
+            frames.clone(), samples.clone(), &train, &val,
             &FastCfg { steps: es, batch: 32, warmup: es / 10, val_every: (es / 4).max(1), lr: 5e-4, wd: 1e-4, workers },
             &device, "../ckpt_expr.mpk",
         )
     } else {
         f32::INFINITY
     };
-    let g = gaze_h.map(|h| h.join().unwrap()).unwrap_or(f32::INFINITY);
+    // Sequential (low-VRAM) mode: gaze runs AFTER expr on the SAME device — one cubecl server, one
+    // pool set, and expr's transient pages have been returned by the time gaze allocates.
+    let g = if seq && only != "expr" {
+        fit_gaze_fast::<AB>(frames, samples, &train, &val, &gaze_cfg, &device, "../ckpt_gaze.mpk")
+    } else {
+        gaze_h.map(|h| h.join().unwrap()).unwrap_or(f32::INFINITY)
+    };
     println!("\nBEST expr mse={e:.5} | BEST gaze mae={g:.2}deg");
 }

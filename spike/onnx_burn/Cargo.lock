@@ -4698,6 +4698,7 @@ dependencies = [
  "burn-fusion",
  "burn-import",
  "burn-store",
+ "cubecl-runtime",
  "image",
  "npyz",
  "rayon",

@@ -482,6 +482,7 @@ fn cos_lr(step: usize, steps: usize, warmup: usize, lr: f64) -> f64 {
     }
 }
 
+#[derive(Clone)]
 pub struct FastCfg {
     pub steps: usize,
     pub batch: usize,
@@ -629,18 +630,25 @@ where
     let w = Arc::new(Weighted::expr(&samples, train, 4.0));
     let pools = Arc::new(Pools::expr_build(&samples, train));
     // GPU-aug tiering: BB_GPU_AUG=0 forces the CPU-aug path; =1 forces device-resident frames;
-    // unset = auto — resident only if the frame store fits the VRAM budget (BB_VRAM_MB, default
-    // 2000 MB for the store itself; training needs ~5 GB on top). There is no reliable free-VRAM
-    // query through wgpu, so low-VRAM systems fall back to CPU aug rather than risking OOM.
+    // =2 forces the per-step tier (upload only the step's ~5 MB of unique frames, ids remapped);
+    // unset = auto — resident if the whole frame store fits the VRAM budget (BB_VRAM_MB, default
+    // 2000 MB for the store itself), else per-step (fused kernels either way, identical output).
+    #[derive(PartialEq, Clone, Copy)]
+    enum AugTier { Cpu, Resident, PerStep }
     let frames_mb = frames.raw().len() * S * S / 4 * 4 / (1 << 20);
     let vram_budget_mb: usize = std::env::var("BB_VRAM_MB").ok().and_then(|v| v.parse().ok()).unwrap_or(2000);
-    let gpu_aug_on = match std::env::var("BB_GPU_AUG").ok().as_deref() {
-        Some("0") => false,
-        Some("1") => true,
-        _ => frames_mb <= vram_budget_mb,
+    let aug_tier = match std::env::var("BB_GPU_AUG").ok().as_deref() {
+        Some("0") => AugTier::Cpu,
+        Some("1") => AugTier::Resident,
+        Some("2") => AugTier::PerStep,
+        _ if frames_mb <= vram_budget_mb => AugTier::Resident,
+        _ => AugTier::PerStep,
     };
-    if !gpu_aug_on {
-        println!("[expr] gpu-aug OFF (frames {frames_mb} MB vs budget {vram_budget_mb} MB or BB_GPU_AUG=0) — CPU aug path");
+    let gpu_aug_on = aug_tier != AugTier::Cpu;
+    match aug_tier {
+        AugTier::Cpu => println!("[expr] gpu-aug OFF — CPU aug path"),
+        AugTier::PerStep => println!("[expr] gpu-aug PER-STEP (frames {frames_mb} MB > budget {vram_budget_mb} MB or BB_GPU_AUG=2)"),
+        AugTier::Resident => {}
     }
 
     // Paired-eye stream for evenness (both stages) + consensus (stage B). pbatch = batch/2 (reference
@@ -682,9 +690,14 @@ where
         has_unlab: bool,
     }
     let arx = if gpu_aug_on {
-        // GPU-aug arm: spec workers + on-device mega-batch build. Frames go device-resident once.
-        let gframes = <B::InnerBackend as AugBackend>::aug_upload(frames.raw(), device);
-        println!("[expr] frames resident on device: {} eyes (~{} MB u8-packed)", frames.raw().len(), frames.raw().len() * S * S / (1 << 20));
+        // GPU-aug arm: spec workers + on-device mega-batch build. Resident tier uploads the whole
+        // frame store once; per-step tier packs+uploads only each step's unique frames (~5 MB).
+        let gframes = (aug_tier == AugTier::Resident).then(|| {
+            let g = <B::InnerBackend as AugBackend>::aug_upload(frames.raw(), device);
+            println!("[expr] frames resident on device: {} eyes (~{} MB u8-packed)", frames.raw().len(), frames.raw().len() * S * S / (1 << 20));
+            g
+        });
+        let aframes = frames.clone();
         let rx = spawn_prefetch_spec(frames.clone(), samples.clone(), w, cfg.batch, cfg.workers, 0xE47, pools);
         let prx = do_paired.then(|| spawn_paired_prefetch_spec(frames.clone(), paired.clone(), pbatch, cfg.workers, 0x9A17));
         let urx = do_unlab.then(|| spawn_unlabeled_prefetch_spec(frames.clone(), unlab.clone(), present.clone(), ub, cfg.workers, 0x51A9));
@@ -740,7 +753,10 @@ where
                 let has_unlab = unlab_b.is_some();
                 debug_assert_eq!(specs.len(), rows);
                 let lbl = Tensor::<B::InnerBackend, 1>::from_data(TensorData::new(lbl, [lbl_len]), &adev);
-                let big_i = <B::InnerBackend as AugBackend>::aug_batch(&gframes, &specs, &adev);
+                let big_i = match &gframes {
+                    Some(g) => <B::InnerBackend as AugBackend>::aug_batch(g, &specs, &adev),
+                    None => <B::InnerBackend as AugBackend>::aug_batch_step(aframes.raw(), &specs, &adev),
+                };
                 let sb = StepBatch {
                     big_i, lbl, y_end, off_pl, off_pr, off_cs, off_cw, off_nw,
                     pll_off, prl_off, ok_off, has_paired, has_unlab,
