@@ -20,6 +20,7 @@ use crate::data::{process_eye, Bin, Sample, S, T};
 use crate::ema::ema_update;
 use crate::flat_opt::{Filter, FlatAdamW, FlatEma};
 use crate::gaze::MicroChad;
+use crate::gpu_aug::{AugBackend, AugSpec};
 use crate::heads::ConsensusHeads;
 use crate::losses::{consensus_term, evenness, mt_consistency, supervised_deconfuse, temporal, ExprConsts};
 use crate::mnv4::Mnv4;
@@ -225,6 +226,122 @@ fn spawn_paired_prefetch(
                     prl.extend_from_slice(&paired.rl[k]);
                 }
                 if tx.send((pl, pr, pll, prl)).is_err() {
+                    break;
+                }
+            }
+        });
+    }
+    rx
+}
+
+
+// ---- GPU-aug spec workers: same sampling + SAME rng consumption order as the CPU workers, but
+// they emit AugSpec rows (indices + params) instead of augmented pixels. ----
+
+type SpecBatch = (Vec<AugSpec>, Vec<f32>);
+
+fn spawn_prefetch_spec(
+    frames: Arc<Frames>, samples: Arc<Vec<Sample>>, w: Arc<Weighted>, batch: usize, workers: usize,
+    seed: u64, pools: Arc<Pools>,
+) -> Receiver<SpecBatch> {
+    let (tx, rx) = sync_channel::<SpecBatch>(workers * 2);
+    for wi in 0..workers.max(1) {
+        let (frames, samples, w, tx, pools) =
+            (frames.clone(), samples.clone(), w.clone(), tx.clone(), pools.clone());
+        thread::spawn(move || {
+            let mut rng = Rng::new(seed.wrapping_add((wi as u64).wrapping_mul(2654435761)));
+            loop {
+                let idxs: Vec<usize> = (0..batch).map(|_| w.sample(&mut rng)).collect();
+                let mut specs = Vec::with_capacity(batch);
+                let mut ys = Vec::with_capacity(batch * 4);
+                for &i in &idxs {
+                    let smp = &samples[i];
+                    let r = rng.f01();
+                    let neutral_mix = r < 0.5 && !pools.neutral.is_empty() && !pools.expr.is_empty();
+                    let cross_mix = !neutral_mix && r < 0.65 && pools.all.len() > 1;
+                    if neutral_mix || cross_mix {
+                        let (ia, ib) = if neutral_mix {
+                            (pools.neutral[rng.usize(pools.neutral.len())], pools.expr[rng.usize(pools.expr.len())])
+                        } else {
+                            (pools.all[rng.usize(pools.all.len())], pools.all[rng.usize(pools.all.len())])
+                        };
+                        let lam = rng.f01();
+                        let (sa, sb) = (&samples[ia], &samples[ib]);
+                        let ids_a = frames.stack_ids(sa.rec, sa.side);
+                        let ids_b = frames.stack_ids(sb.rec, sb.side);
+                        specs.push(AugSpec::mixup(ids_a, ids_b, lam, &mut rng));
+                        for c in 0..4 {
+                            ys.push((1.0 - lam) * sa.label[2 + c] + lam * sb.label[2 + c]);
+                        }
+                    } else {
+                        specs.push(AugSpec::strong(frames.stack_ids(smp.rec, smp.side), &mut rng));
+                        ys.extend_from_slice(&smp.label[2..6]);
+                    }
+                }
+                if tx.send((specs, ys)).is_err() {
+                    break;
+                }
+            }
+        });
+    }
+    rx
+}
+
+type PairedSpecBatch = (Vec<AugSpec>, Vec<AugSpec>, Vec<f32>, Vec<f32>);
+
+fn spawn_paired_prefetch_spec(
+    frames: Arc<Frames>, paired: Arc<Paired>, pbatch: usize, workers: usize, seed: u64,
+) -> Receiver<PairedSpecBatch> {
+    let (tx, rx) = sync_channel::<PairedSpecBatch>(workers * 2);
+    for wi in 0..workers.max(1) {
+        let (frames, paired, tx) = (frames.clone(), paired.clone(), tx.clone());
+        thread::spawn(move || {
+            let mut rng = Rng::new(seed.wrapping_add((wi as u64).wrapping_mul(0x9E3779B1)));
+            loop {
+                let (mut sl, mut sr, mut pll, mut prl) =
+                    (Vec::with_capacity(pbatch), Vec::with_capacity(pbatch), Vec::new(), Vec::new());
+                for _ in 0..pbatch {
+                    let k = paired.sample(&mut rng);
+                    let rec = paired.recs[k];
+                    sl.push(AugSpec::strong(frames.stack_ids(rec, 0), &mut rng));
+                    sr.push(AugSpec::strong(frames.stack_ids(rec, 1), &mut rng));
+                    pll.extend_from_slice(&paired.ll[k]);
+                    prl.extend_from_slice(&paired.rl[k]);
+                }
+                if tx.send((sl, sr, pll, prl)).is_err() {
+                    break;
+                }
+            }
+        });
+    }
+    rx
+}
+
+type UnlabSpecBatch = (Vec<AugSpec>, Vec<AugSpec>, Vec<AugSpec>, Vec<f32>);
+
+fn spawn_unlabeled_prefetch_spec(
+    frames: Arc<Frames>, unlab: Arc<Unlabeled>, present: Arc<HashSet<(usize, usize)>>, ub: usize,
+    workers: usize, seed: u64,
+) -> Receiver<UnlabSpecBatch> {
+    let (tx, rx) = sync_channel::<UnlabSpecBatch>(workers * 2);
+    for wi in 0..workers.max(1) {
+        let (frames, unlab, present, tx) = (frames.clone(), unlab.clone(), present.clone(), tx.clone());
+        thread::spawn(move || {
+            let mut rng = Rng::new(seed.wrapping_add((wi as u64).wrapping_mul(0x85EBCA77)));
+            loop {
+                let (mut cs, mut cw, mut nw, mut ok) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+                for _ in 0..ub {
+                    let (rec, side) = unlab.items[rng.usize(unlab.items.len())];
+                    let ids = frames.stack_ids(rec, side);
+                    cs.push(AugSpec::strong(ids, &mut rng));
+                    let g = aug::sample_geom_weak(&mut rng);
+                    cw.push(AugSpec::weak(ids, &g, &mut rng));
+                    let has_nbr = rec >= 1 && present.contains(&(rec - 1, side));
+                    let nbr_ids = if has_nbr { frames.stack_ids(rec - 1, side) } else { ids };
+                    nw.push(AugSpec::weak(nbr_ids, &g, &mut rng));
+                    ok.push(if has_nbr { 1.0 } else { 0.0 });
+                }
+                if tx.send((cs, cw, nw, ok)).is_err() {
                     break;
                 }
             }
@@ -497,7 +614,10 @@ fn eval_consensus<BI: Backend>(
 pub fn fit_expr_staged<B: AutodiffBackend>(
     frames: Arc<Frames>, samples: Arc<Vec<Sample>>, train: &[usize], val: &[usize], cfg: &FastCfg,
     device: &B::Device, ckpt: &str,
-) -> f32 {
+) -> f32
+where
+    B::InnerBackend: AugBackend,
+{
     let scale = (cfg.batch as f64 / 64.0).sqrt();
     let a_steps = cfg.steps / 2;
     let b_steps = cfg.steps - a_steps;
@@ -508,7 +628,20 @@ pub fn fit_expr_staged<B: AutodiffBackend>(
 
     let w = Arc::new(Weighted::expr(&samples, train, 4.0));
     let pools = Arc::new(Pools::expr_build(&samples, train));
-    let rx = spawn_prefetch(frames.clone(), samples.clone(), w, cfg.batch, cfg.workers, true, 0xE47, pools);
+    // GPU-aug tiering: BB_GPU_AUG=0 forces the CPU-aug path; =1 forces device-resident frames;
+    // unset = auto — resident only if the frame store fits the VRAM budget (BB_VRAM_MB, default
+    // 2000 MB for the store itself; training needs ~5 GB on top). There is no reliable free-VRAM
+    // query through wgpu, so low-VRAM systems fall back to CPU aug rather than risking OOM.
+    let frames_mb = frames.raw().len() * S * S / 4 * 4 / (1 << 20);
+    let vram_budget_mb: usize = std::env::var("BB_VRAM_MB").ok().and_then(|v| v.parse().ok()).unwrap_or(2000);
+    let gpu_aug_on = match std::env::var("BB_GPU_AUG").ok().as_deref() {
+        Some("0") => false,
+        Some("1") => true,
+        _ => frames_mb <= vram_budget_mb,
+    };
+    if !gpu_aug_on {
+        println!("[expr] gpu-aug OFF (frames {frames_mb} MB vs budget {vram_budget_mb} MB or BB_GPU_AUG=0) — CPU aug path");
+    }
 
     // Paired-eye stream for evenness (both stages) + consensus (stage B). pbatch = batch/2 (reference
     // EXPR_EVEN_BATCH). Falls back to expr-only if the capture has no records with both eyes valid.
@@ -516,9 +649,7 @@ pub fn fit_expr_staged<B: AutodiffBackend>(
     let do_paired = !paired.is_empty();
     let paired_val = Paired::build(&samples, val); // held-out paired eyes for the consensus val metric
     let pbatch = (cfg.batch / 2).max(1);
-    let prx = do_paired.then(|| {
-        spawn_paired_prefetch(frames.clone(), paired.clone(), pbatch, cfg.workers, 0x9A17)
-    });
+
     // Explicit consensus checkpoint path — never a blind replace that could collide with the expr ckpt
     // if it lacks "expr". Delete any stale one up front so a run that trains no consensus (no paired
     // data) can't leave an old cons that export_bridge would wrongly fuse into a 15-dim brow.
@@ -531,8 +662,7 @@ pub fn fit_expr_staged<B: AutodiffBackend>(
     let ub = cfg.batch;
     // (rec,side) of every GOOD decoded eye — lets the temporal stream reject blank/non-good neighbors.
     let present: Arc<HashSet<(usize, usize)>> = Arc::new(samples.iter().map(|s| (s.rec, s.side)).collect());
-    let urx = do_unlab.then(|| spawn_unlabeled_prefetch(frames.clone(), unlab.clone(), present.clone(), ub, cfg.workers, 0x51A9));
-    println!("[expr] paired={} ({} recs) unlabeled={} ({} frames)", do_paired, paired.recs.len(), do_unlab, unlab.items.len());
+    println!("[expr] paired={} ({} recs) unlabeled={} ({} frames) gpu_aug={}", do_paired, paired.recs.len(), do_unlab, unlab.items.len(), gpu_aug_on);
 
     // Assembler thread: receives the three prefetch streams, concatenates the mega-batch + packed
     // labels, and uploads BOTH tensors to the device off the critical thread (double-buffered).
@@ -551,7 +681,80 @@ pub fn fit_expr_staged<B: AutodiffBackend>(
         has_paired: bool,
         has_unlab: bool,
     }
-    let arx = {
+    let arx = if gpu_aug_on {
+        // GPU-aug arm: spec workers + on-device mega-batch build. Frames go device-resident once.
+        let gframes = <B::InnerBackend as AugBackend>::aug_upload(frames.raw(), device);
+        println!("[expr] frames resident on device: {} eyes (~{} MB u8-packed)", frames.raw().len(), frames.raw().len() * S * S / (1 << 20));
+        let rx = spawn_prefetch_spec(frames.clone(), samples.clone(), w, cfg.batch, cfg.workers, 0xE47, pools);
+        let prx = do_paired.then(|| spawn_paired_prefetch_spec(frames.clone(), paired.clone(), pbatch, cfg.workers, 0x9A17));
+        let urx = do_unlab.then(|| spawn_unlabeled_prefetch_spec(frames.clone(), unlab.clone(), present.clone(), ub, cfg.workers, 0x51A9));
+        let (atx, arx) = sync_channel::<StepBatch<B::InnerBackend>>(2);
+        let adev = device.clone();
+        let batch = cfg.batch;
+        thread::spawn(move || {
+            for step in 0.. {
+                let stage_b = step >= a_steps;
+                let (mut specs, ys) = match rx.recv() {
+                    Ok(b) => b,
+                    Err(_) => break,
+                };
+                let mut rows = batch;
+                let paired_b = prx.as_ref().map(|p| p.recv().unwrap());
+                let (mut off_pl, mut off_pr) = (0usize, 0usize);
+                if let Some((sl, sr, _, _)) = &paired_b {
+                    off_pl = rows;
+                    specs.extend_from_slice(sl);
+                    rows += pbatch;
+                    off_pr = rows;
+                    specs.extend_from_slice(sr);
+                    rows += pbatch;
+                }
+                let unlab_b = if stage_b { urx.as_ref().map(|u| u.recv().unwrap()) } else { None };
+                let (mut off_cs, mut off_cw, mut off_nw) = (0usize, 0usize, 0usize);
+                if let Some((cs, cw, nw, _)) = &unlab_b {
+                    off_cs = rows;
+                    specs.extend_from_slice(cs);
+                    rows += ub;
+                    off_cw = rows;
+                    specs.extend_from_slice(cw);
+                    rows += ub;
+                    off_nw = rows;
+                    specs.extend_from_slice(nw);
+                    rows += ub;
+                }
+                let mut lbl = ys;
+                let y_end = lbl.len();
+                let (mut pll_off, mut prl_off, mut ok_off) = (0usize, 0usize, 0usize);
+                if let Some((_, _, plld, prld)) = &paired_b {
+                    pll_off = lbl.len();
+                    lbl.extend_from_slice(plld);
+                    prl_off = lbl.len();
+                    lbl.extend_from_slice(prld);
+                }
+                if let Some((_, _, _, ok)) = &unlab_b {
+                    ok_off = lbl.len();
+                    lbl.extend_from_slice(ok);
+                }
+                let lbl_len = lbl.len();
+                let has_paired = paired_b.is_some();
+                let has_unlab = unlab_b.is_some();
+                debug_assert_eq!(specs.len(), rows);
+                let lbl = Tensor::<B::InnerBackend, 1>::from_data(TensorData::new(lbl, [lbl_len]), &adev);
+                let big_i = <B::InnerBackend as AugBackend>::aug_batch(&gframes, &specs, &adev);
+                let sb = StepBatch {
+                    big_i, lbl, y_end, off_pl, off_pr, off_cs, off_cw, off_nw,
+                    pll_off, prl_off, ok_off, has_paired, has_unlab,
+                };
+                if atx.send(sb).is_err() {
+                    break;
+                }
+            }
+        });
+        arx
+    } else {
+        let rx = spawn_prefetch(frames.clone(), samples.clone(), w, cfg.batch, cfg.workers, true, 0xE47, pools);
+        let prx = do_paired.then(|| spawn_paired_prefetch(frames.clone(), paired.clone(), pbatch, cfg.workers, 0x9A17));
+        let urx = do_unlab.then(|| spawn_unlabeled_prefetch(frames.clone(), unlab.clone(), present.clone(), ub, cfg.workers, 0x51A9));
         let (atx, arx) = sync_channel::<StepBatch<B::InnerBackend>>(2);
         let adev = device.clone();
         let batch = cfg.batch;
