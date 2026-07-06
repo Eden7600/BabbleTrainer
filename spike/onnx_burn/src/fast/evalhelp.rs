@@ -56,7 +56,17 @@ pub(crate) fn cos_lr(step: usize, steps: usize, warmup: usize, lr: f64) -> f64 {
 // starts from ImageNet features instead of random. mnv4_parity.rs proves this load matches timm
 // block-by-block. Returns true if the weights were found and loaded.
 pub(crate) fn load_pretrained_expr<B: Backend>(model: &mut Mnv4<B>) -> bool {
-    for path in ["../mnv4_weights.safetensors", "mnv4_weights.safetensors"] {
+    // BB_EXPR_WARM warm-starts from the trained expr model (expr_weights.safetensors, parity with the
+    // deployed Python model_best.pt student, incl. the classifier head) instead of just the ImageNet
+    // MNv4 backbone. Falls back to the backbone if the trained-expr file is absent.
+    let mut paths: Vec<&str> = Vec::new();
+    if std::env::var("BB_EXPR_WARM").is_ok() {
+        paths.push("../expr_weights.safetensors");
+        paths.push("expr_weights.safetensors");
+    }
+    paths.push("../mnv4_weights.safetensors");
+    paths.push("mnv4_weights.safetensors");
+    for path in paths {
         if std::path::Path::new(path).exists() {
             let mut store = SafetensorsStore::from_file(path)
                 .with_from_adapter(PyTorchToBurnAdapter)
@@ -66,17 +76,40 @@ pub(crate) fn load_pretrained_expr<B: Backend>(model: &mut Mnv4<B>) -> bool {
                 .validate(false);
             match model.load_from(&mut store) {
                 Ok(res) => {
-                    println!("[expr] pretrained init from {path}: {res}");
+                    println!("[expr] init from {path}: {res}");
+                    return true;
+                }
+                Err(e) => println!("[expr] load {path} failed ({e}); trying next"),
+            }
+        }
+    }
+    println!("[expr] no pretrained weights found; random init");
+    false
+}
+
+// Optional gaze warm-start (parity with the deployed Python recipe: load a 12k-step MicroChad prior
+// then fine-tune per user). Off by default — Burn trains gaze from scratch. MicroChad field names
+// (conv1..conv6, fc_gaze) match the torch checkpoint keys 1:1; no BatchNorm so no gamma/beta remap.
+pub(crate) fn load_pretrained_gaze<B: Backend>(model: &mut MicroChad<B>) -> bool {
+    for path in ["../gaze_weights.safetensors", "gaze_weights.safetensors"] {
+        if std::path::Path::new(path).exists() {
+            let mut store = SafetensorsStore::from_file(path)
+                .with_from_adapter(PyTorchToBurnAdapter)
+                .allow_partial(true)
+                .validate(false);
+            match model.load_from(&mut store) {
+                Ok(res) => {
+                    println!("[gaze] warm-start from {path}: {res}");
                     return true;
                 }
                 Err(e) => {
-                    println!("[expr] pretrained load failed ({e}); random init");
+                    println!("[gaze] warm-start load failed ({e}); cold start");
                     return false;
                 }
             }
         }
     }
-    println!("[expr] no pretrained weights found; random init");
+    println!("[gaze] no gaze prior found (gaze_weights.safetensors); cold start");
     false
 }
 

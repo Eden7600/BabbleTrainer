@@ -20,7 +20,7 @@ use crate::losses::{consensus_term, evenness, mt_consistency, supervised_deconfu
 use crate::mnv4::Mnv4;
 use crate::sampler::{gaze_weights, Weighted};
 
-use super::evalhelp::{cos_lr, eval_consensus, eval_expr, eval_gaze, load_pretrained_expr};
+use super::evalhelp::{cos_lr, eval_consensus, eval_expr, eval_gaze, load_pretrained_expr, load_pretrained_gaze};
 use super::frames::Frames;
 use super::index::{Paired, Pools, Unlabeled};
 use super::prefetch::{
@@ -533,6 +533,11 @@ pub fn fit_gaze_fast<B: AutodiffBackend>(
     let pools = Arc::new(Pools::empty());
     let rx = spawn_prefetch(frames.clone(), samples.clone(), w, cfg.batch, cfg.workers, false, 0x6A2E, pools);
     let mut model = MicroChad::<B>::new(T, 2, device);
+    // Opt-in gaze warm-start (BB_GAZE_WARM=1) mirrors the deployed Python recipe (12k-step MicroChad
+    // prior + per-user fine-tune). Default = cold start (Burn's regime trains gaze from scratch).
+    if std::env::var("BB_GAZE_WARM").is_ok() {
+        load_pretrained_gaze(&mut model);
+    }
     let mut opt = AdamWConfig::new().with_weight_decay(cfg.wd).init();
     let mut best = f32::INFINITY; // best val MSE (selection metric, matches BabbleTrainer)
     let mut best_mae = f32::INFINITY; // MAE(deg) at the best-MSE checkpoint (for the summary line)
