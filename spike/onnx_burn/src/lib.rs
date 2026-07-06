@@ -10,5 +10,6 @@ pub mod gpu_aug;
 pub mod heads;
 pub mod losses;
 pub mod mnv4;
+pub mod onnx_export;
 pub mod sampler;
 pub mod train;

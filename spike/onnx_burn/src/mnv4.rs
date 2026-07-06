@@ -61,6 +61,11 @@ impl<B: Backend> ConvBn<B> {
         let h = self.bn.forward(self.conv.forward(x));
         if *self.act { relu(h) } else { h }
     }
+
+    fn onnx(&self, g: &mut crate::onnx_export::OnnxGraph, p: &str, x: &str) -> String {
+        let h = g.conv_bn(p, x, &self.conv, &self.bn);
+        if *self.act { g.relu(&h) } else { h }
+    }
 }
 
 #[derive(Module, Debug)]
@@ -110,6 +115,21 @@ impl<B: Backend> Block<B> {
             if let Some(m) = &self.pw_proj { h = m.forward(h); }
         }
         if *self.residual { h + inp } else { h }
+    }
+
+    fn onnx(&self, g: &mut crate::onnx_export::OnnxGraph, p: &str, x: &str) -> String {
+        let mut h = x.to_string();
+        if let (Some(c), Some(b)) = (&self.conv, &self.bn1) {
+            h = g.conv_bn(p, &h, c, b);
+            h = g.relu(&h);
+        } else {
+            for (name, cb) in [("dws", &self.dw_start), ("pwe", &self.pw_exp), ("dwm", &self.dw_mid), ("pwp", &self.pw_proj)] {
+                if let Some(cb) = cb {
+                    h = cb.onnx(g, &format!("{p}_{name}"), &h);
+                }
+            }
+        }
+        if *self.residual { g.add(&h, x) } else { h }
     }
 
     fn collect_bn_ids(&self, out: &mut Vec<ParamId>) {
@@ -228,6 +248,24 @@ impl<B: Backend> Mnv4<B> {
             self.classifier.bias = Some(burn::module::Param::from_tensor(Tensor::<B, 1>::zeros([dout], dev)));
             let _ = b;
         }
+    }
+
+    // Emit this net into an ONNX graph, mirroring forward_features + classify (onnx_export.rs).
+    // Returns (feat, logits) tensor names; feat feeds the consensus heads.
+    pub fn onnx(&self, g: &mut crate::onnx_export::OnnxGraph, p: &str, x: &str) -> (String, String) {
+        let mut h = g.conv_bn(&format!("{p}_stem"), x, &self.conv_stem, &self.bn1);
+        h = g.relu(&h);
+        for (si, stage) in self.blocks.iter().enumerate() {
+            for (bi, blk) in stage.iter().enumerate() {
+                h = blk.onnx(g, &format!("{p}_b{si}_{bi}"), &h);
+            }
+        }
+        let pooled = g.global_avg_pool(&h);
+        let h = g.conv_bn(&format!("{p}_head"), &pooled, &self.conv_head, &self.norm_head);
+        let h = g.relu(&h);
+        let feat = g.flatten(&h);
+        let logits = g.linear(&format!("{p}_classifier"), &feat, &self.classifier);
+        (feat, logits)
     }
 
     // Collect per-stage outputs for block-by-block parity. stem/conv_head are recorded CONV-ONLY to

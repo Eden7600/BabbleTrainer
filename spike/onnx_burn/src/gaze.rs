@@ -37,6 +37,22 @@ impl<B: Backend> MicroChad<B> {
         }
     }
 
+    // Emit into an ONNX graph, mirroring forward (onnx_export.rs). Returns the sigmoid output name.
+    pub fn onnx(&self, g: &mut crate::onnx_export::OnnxGraph, p: &str, x: &str) -> String {
+        let mut h = x.to_string();
+        for (i, conv) in [&self.conv1, &self.conv2, &self.conv3, &self.conv4, &self.conv5].iter().enumerate() {
+            h = g.conv(&format!("{p}_gc{}", i + 1), &h, conv);
+            h = g.relu(&h);
+            h = g.maxpool2(&h);
+        }
+        h = g.conv(&format!("{p}_gc6"), &h, &self.conv6);
+        h = g.relu(&h);
+        h = g.reduce_max_hw(&h);
+        h = g.flatten(&h);
+        let h = g.linear(&format!("{p}_fc_gaze"), &h, &self.fc_gaze);
+        g.sigmoid(&h)
+    }
+
     pub fn forward(&self, x: Tensor<B, 4>) -> Tensor<B, 2> {
         let mut h = self.pool.forward(relu(self.conv1.forward(x)));
         h = self.pool.forward(relu(self.conv2.forward(h)));

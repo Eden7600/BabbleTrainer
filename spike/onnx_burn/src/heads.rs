@@ -46,4 +46,17 @@ impl<B: Backend> ConsensusHeads<B> {
     pub fn forward(&self, i: usize, fl: Tensor<B, 2>, fr: Tensor<B, 2>) -> Tensor<B, 2> {
         self.heads[i].forward(fl, fr)
     }
+
+    // Emit into an ONNX graph (onnx_export.rs): one shared L/R feature concat feeds every head;
+    // returns the concatenated [widen, squint, brow] output name.
+    pub fn onnx(&self, g: &mut crate::onnx_export::OnnxGraph, feat_l: &str, feat_r: &str) -> String {
+        let x = g.concat(&[feat_l, feat_r]);
+        let outs: Vec<String> = self.heads.iter().enumerate().map(|(i, head)| {
+            let h = g.linear(&format!("cons{i}_fc1"), &x, &head.fc1);
+            let h = g.relu(&h);
+            let h = g.linear(&format!("cons{i}_fc2"), &h, &head.fc2);
+            g.sigmoid(&h)
+        }).collect();
+        g.concat(&outs.iter().map(|s| s.as_str()).collect::<Vec<_>>())
+    }
 }
