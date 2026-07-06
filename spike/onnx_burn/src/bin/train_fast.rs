@@ -48,6 +48,26 @@ fn pool_opts(page_mb: u64) -> RuntimeOptions {
     }
 }
 
+// f32 buffer atomic-add is missing on e.g. RADV pre-RDNA3 and old Intel iGPUs; reduce then falls
+// back to the chained (non-atomic) kernel, so this is informational, not fatal.
+fn print_gpu_caps(device: &WgpuDevice) {
+    use burn::backend::wgpu::WgpuRuntime;
+    use burn_cubecl::cubecl::{
+        features::AtomicUsage,
+        ir::{ElemType, FloatKind, StorageType, Type},
+        Runtime,
+    };
+    let client = WgpuRuntime::client(device);
+    let f32_add = client
+        .properties()
+        .atomic_type_usage(Type::new(StorageType::Atomic(ElemType::Float(FloatKind::F32))))
+        .contains(AtomicUsage::Add);
+    println!(
+        "[gpu] f32 buffer atomic-add: {}",
+        if f32_add { "yes" } else { "NO (reduce falls back to chained kernels)" },
+    );
+}
+
 // Free VRAM in MB (NVIDIA). Unused at the LOW default; kept for re-benchmarking on faster GPUs.
 #[allow(dead_code)]
 fn free_vram_mb() -> Option<u64> {
@@ -136,6 +156,7 @@ fn main() {
     );
 
     let device = Default::default();
+    print_gpu_caps(&device);
     println!("parsing {bin_path} ...");
     let bin = parse_bin(&bin_path).expect("parse bin");
     let t = Instant::now();
