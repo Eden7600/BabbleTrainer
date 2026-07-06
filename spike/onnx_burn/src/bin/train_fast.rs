@@ -48,8 +48,7 @@ fn pool_opts(page_mb: u64) -> RuntimeOptions {
     }
 }
 
-// Free VRAM right now, in MB (NVIDIA only). Unused since LOW became the pegged default; kept for
-// re-benchmarking the tier ladder on faster GPUs.
+// Free VRAM in MB (NVIDIA). Unused at the LOW default; kept for re-benchmarking on faster GPUs.
 #[allow(dead_code)]
 fn free_vram_mb() -> Option<u64> {
     let out = std::process::Command::new("nvidia-smi")
@@ -114,17 +113,10 @@ fn main() {
     let gs: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(3200);
     let workers: usize = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(6);
 
-    // ---- VRAM policy ----------------------------------------------------------------------
-    // DEFAULT = LOW tier, always. Measured on a 3060 (full 4000/3200 run, pools capped):
-    //   FAST  concurrent + resident frame store   peak 5438 MiB   8m58s
-    //   MID   concurrent + per-step frame upload  peak 4725 MiB   8m52s
-    //   LOW   sequential + per-step               peak 3380 MiB   8m48s  (32 MB pool pages)
-    // Wall time is FLAT across tiers (expr is host-bound; gaze concurrency buys nothing), so
-    // higher tiers spend VRAM for zero speed — LOW strictly dominates, and it must coexist with
-    // VRChat on the user's GPU. Overrides for experiments / future GPUs where expr goes
-    // GPU-bound and concurrency might pay: BB_SEQ=0 (concurrent, dual device), BB_GPU_AUG=1
-    // (resident store), BB_VRAM_MB (store-fits budget for fast.rs auto), BB_POOL_MB (default
-    // 32, 0 = uncapped cubecl defaults). Re-benchmark the ladder on a 5090 before revisiting.
+    // DEFAULT = LOW tier. Measured on a 3060 (4000/3200, pools capped): FAST 5438MiB/8m58s,
+    // MID 4725MiB/8m52s, LOW 3380MiB/8m48s. Wall is flat across tiers (expr host-bound), so LOW
+    // strictly wins on VRAM and must coexist with VRChat. Overrides below (BB_SEQ/BB_GPU_AUG/
+    // BB_VRAM_MB/BB_POOL_MB) opt up for GPUs where expr turns GPU-bound and concurrency pays.
     let seq = std::env::var("BB_SEQ").ok().as_deref() != Some("0");
     if std::env::var("BB_GPU_AUG").is_err() && std::env::var("BB_VRAM_MB").is_err() {
         // fast.rs picks resident iff the frame store fits BB_VRAM_MB: 0 = always per-step.
