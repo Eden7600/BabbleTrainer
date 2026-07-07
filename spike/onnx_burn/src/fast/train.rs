@@ -39,6 +39,32 @@ pub struct FastCfg {
     pub workers: usize,
 }
 
+// TrainerService stdout protocol (BB_LOG=frontend): one "Batch i/N, Loss: x" line per step on the
+// unified expr+gaze axis (BB_PROG_OFFSET/BB_PROG_TOTAL), mirroring train_frontend.py. The loss
+// value only re-syncs when `fresh` is provided — a per-step into_scalar() would stall the dispatch
+// pipeline these loops exist to keep full.
+struct Frontend {
+    offset: usize,
+    total: usize,
+    loss: f32,
+}
+
+impl Frontend {
+    fn new() -> Option<Self> {
+        let env = |k: &str| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+        (std::env::var("BB_LOG").ok().as_deref() == Some("frontend"))
+            .then(|| Self { offset: env("BB_PROG_OFFSET"), total: env("BB_PROG_TOTAL"), loss: 0.0 })
+    }
+
+    fn step(&mut self, step: usize, fresh: Option<f32>) {
+        if let Some(l) = fresh {
+            self.loss = l;
+        }
+        let i = self.offset + step + 1;
+        println!("Batch {i}/{}, Loss: {:.6}", self.total.max(i), self.loss);
+    }
+}
+
 // 2-stage expression curriculum (BabbleTrainer fit_expr_stages), pretrained-backbone init, and
 // backbone/head param-group LRs with a frozen-backbone warmup. Total budget = cfg.steps (split 50/50
 // into stage A + stage B), batch = cfg.batch, so the per-user regime is preserved. Reference LRs are
@@ -332,6 +358,7 @@ where
     let micro = prof_lvl >= 2;
     let psync = |on: bool| { if on { let _ = B::sync(device); } };
     let mut pt = [0f32; 8]; // recv h2d fwd aux bwd opt ema sync
+    let mut fe = Frontend::new();
 
     for step in 0..cfg.steps {
         let stage_b = step >= a_steps;
@@ -482,6 +509,9 @@ where
             let _ = out.slice([0..1, 0..1]).into_data(); // force queue drain: GPU tail time
             pt[7] += t0.elapsed().as_secs_f32();
         }
+        if let Some(f) = fe.as_mut() {
+            f.step(step, (step % 20 == 0).then(|| loss.clone().into_scalar().elem::<f32>()));
+        }
         if step % 100 == 99 {
             let dt = win.elapsed().as_secs_f32();
             println!("[expr {step:5}] {:.1} ms/step ({}) windowed", dt * 10.0, if stage_b { "B" } else { "A" });
@@ -549,6 +579,7 @@ pub fn fit_gaze_fast<B: AutodiffBackend>(
     let micro = prof_lvl >= 2;
     let psync = |on: bool| { if on { let _ = B::sync(device); } };
     let mut pt = [0f32; 5]; // recv h2d fwd bwd+opt sync
+    let mut fg = Frontend::new();
     for step in 0..cfg.steps {
         let t0 = Instant::now();
         let (xs, ys) = rx.recv().unwrap();
@@ -569,8 +600,11 @@ pub fn fit_gaze_fast<B: AutodiffBackend>(
         pt[3] += t0.elapsed().as_secs_f32();
         if prof {
             let t0 = Instant::now();
-            let _ = loss.into_data(); // force queue drain: GPU tail time
+            let _ = loss.clone().into_data(); // force queue drain: GPU tail time
             pt[4] += t0.elapsed().as_secs_f32();
+        }
+        if let Some(f) = fg.as_mut() {
+            f.step(step, (step % 20 == 0).then(|| loss.clone().into_scalar().elem::<f32>()));
         }
         if step % 100 == 99 {
             let dt = win.elapsed().as_secs_f32();

@@ -3,8 +3,29 @@ name = "onnx_burn"
 version = "0.1.0"
 edition = "2024"
 
+# CUDA is opt-in: the backend needs libnvrtc (CUDA Toolkit redistributable, not the driver) at
+# runtime, so shipped builds stay wgpu/Vulkan-only. cuda bins: cargo build --features cuda.
+[features]
+default = []
+cuda = ["burn/cuda"]
+
+[[bin]]
+name = "train_fast_cuda"
+required-features = ["cuda"]
+
+[[bin]]
+name = "bench_cuda"
+required-features = ["cuda"]
+
+# Packaging profile: fat LTO + stripped (release stays fast-linking for dev iteration).
+[profile.dist]
+inherits = "release"
+lto = true
+codegen-units = 1
+strip = true
+
 [dependencies]
-burn = { version = "0.21.0", features = ["autodiff", "ndarray", "wgpu", "vulkan", "cuda"] }
+burn = { version = "0.21.0", features = ["autodiff", "ndarray", "wgpu", "vulkan"] }
 burn-store = "0.21.0"
 burn-cubecl = "0.21.0"
 burn-fusion = "0.21.0"
