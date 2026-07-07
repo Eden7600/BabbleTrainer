@@ -8,3 +8,5 @@ target/
 *.npz
 spike/intermediates/
 *.mpk
+**/target-steamrt4/
+**/target-win/
