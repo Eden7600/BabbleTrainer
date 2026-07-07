@@ -360,10 +360,13 @@ impl OnnxGraph {
             "[{}]",
             names.iter().map(|n| format!("\"{n}\"")).collect::<Vec<_>>().join(", ")
         );
+        let descriptor = crate::descriptor::build_model_descriptor(names).to_string();
         for (k, v) in [
             ("blendshape_names", json.as_str()),
             ("input_layout", "interleaved_LR_t0..t3_8x128x128_gray01"),
             ("gaze_range_deg", "45.0"),
+            ("baballonia_descriptor", descriptor.as_str()),
+            ("descriptor_schema", "1"),
         ] {
             let mut kv = Vec::new();
             pb_str(&mut kv, 1, k);

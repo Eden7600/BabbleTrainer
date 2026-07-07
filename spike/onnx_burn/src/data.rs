@@ -50,11 +50,14 @@ impl Frame {
 pub struct Bin {
     pub bytes: Vec<u8>,
     pub frames: Vec<Frame>,
+    // First metadata pseudo-record's JSON (take-first, survives Concatenate); None = legacy bin.
+    pub descriptor: Option<serde_json::Value>,
 }
 
 pub fn parse_bin(path: &str) -> std::io::Result<Bin> {
     let bytes = std::fs::read(path)?;
     let mut frames = Vec::new();
+    let mut descriptor = None;
     let mut pos = 0usize;
     while pos + HEADER <= bytes.len() {
         let h = &bytes[pos..pos + HEADER];
@@ -75,10 +78,20 @@ pub fn parse_bin(path: &str) -> std::io::Result<Bin> {
         if data_start + jl + jr > bytes.len() {
             break;
         }
-        frames.push(Frame { off: data_start, jl, jr, state, fields });
+        let payload = &bytes[data_start..data_start + jl];
+        if crate::descriptor::is_metadata_record(state, payload) {
+            if descriptor.is_none() {
+                descriptor = crate::descriptor::parse_metadata_payload(payload);
+            }
+        } else {
+            frames.push(Frame { off: data_start, jl, jr, state, fields });
+        }
         pos = data_start + jl + jr;
     }
-    Ok(Bin { bytes, frames })
+    crate::descriptor::check_bin_compat(descriptor.as_ref())
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData,
+            format!("bin {path} declares conventions this trainer can't honor: {e}")))?;
+    Ok(Bin { bytes, frames, descriptor })
 }
 
 fn decode_gray(buf: &[u8]) -> Option<(Vec<u8>, usize, usize)> {
@@ -92,31 +105,6 @@ fn std_dev(px: &[u8]) -> f32 {
     let mean = px.iter().map(|&p| p as f32).sum::<f32>() / n;
     let var = px.iter().map(|&p| { let d = p as f32 - mean; d * d }).sum::<f32>() / n;
     var.sqrt()
-}
-
-// cv2.equalizeHist: LUT[i] = round((cdf[i]-cdf_min) * 255 / (total-cdf_min)).
-fn equalize_hist(px: &mut [u8]) {
-    let mut hist = [0u32; 256];
-    for &p in px.iter() {
-        hist[p as usize] += 1;
-    }
-    let total = px.len() as u32;
-    let mut cdf = [0u32; 256];
-    let mut acc = 0u32;
-    for i in 0..256 {
-        acc += hist[i];
-        cdf[i] = acc;
-    }
-    let cdf_min = cdf.iter().copied().find(|&c| c > 0).unwrap_or(0);
-    let denom = (total - cdf_min).max(1) as f32;
-    let mut lut = [0u8; 256];
-    for i in 0..256 {
-        let v = ((cdf[i].saturating_sub(cdf_min)) as f32 * 255.0 / denom).round();
-        lut[i] = v.clamp(0.0, 255.0) as u8;
-    }
-    for p in px.iter_mut() {
-        *p = lut[*p as usize];
-    }
 }
 
 fn area_resize_to_s(px: &[u8], w: usize, h: usize) -> Vec<u8> {
@@ -147,7 +135,7 @@ pub fn process_eye(bin: &Bin, rec: usize, side: usize) -> Option<Vec<u8>> {
     // Resize from the REAL decoded dims to 128x128 (non-square eye crops on other headsets no longer
     // panic or shear — was reconstructed as sqrt(len), which assumed a square).
     let mut img = area_resize_to_s(&raw, w, h);
-    equalize_hist(&mut img);
+    crate::descriptor::apply_default_preprocess(&mut img);
     if side == MIRROR_SIDE {
         flip_h(&mut img);
     }

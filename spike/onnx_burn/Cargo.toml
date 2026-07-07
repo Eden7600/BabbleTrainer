@@ -10,9 +10,13 @@ burn-cubecl = "0.21.0"
 burn-fusion = "0.21.0"
 burn-cubecl-fusion = "0.21.0"
 cubecl-runtime = "0.10.0"
-image = { version = "0.25.10", default-features = false, features = ["jpeg"] }
+image = { version = "0.25.10", default-features = false, features = ["jpeg", "png"] }
 npyz = { version = "0.9.1", features = ["npz"] }
 rayon = "1.12.0"
+serde_json = "1"
+
+[dev-dependencies]
+sha2 = "0.10"
 
 [build-dependencies]
 burn-import = "0.21.0"

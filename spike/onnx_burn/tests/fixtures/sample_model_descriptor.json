@@ -1,0 +1,409 @@
+{
+  "schema": 1,
+  "provenance": {
+    "trainer": {
+      "name": "BabbleTrainer",
+      "version": "0.1.0",
+      "git": "da98255-dirty"
+    },
+    "created_utc": "2026-07-06T23:17:47Z"
+  },
+  "model": {
+    "family": "ET-dual",
+    "revision": 3,
+    "roles": [
+      "eyes"
+    ]
+  },
+  "input": {
+    "tensor": "input",
+    "layout": "NCHW",
+    "dtype": "float32",
+    "width": 128,
+    "height": 128,
+    "channels": 8,
+    "range": [
+      0.0,
+      1.0
+    ],
+    "normalization": {
+      "scale": "1/255",
+      "mean": null,
+      "std": null
+    },
+    "streams": {
+      "eye_left": {
+        "kind": "eye.left",
+        "color": "gray"
+      },
+      "eye_right": {
+        "kind": "eye.right",
+        "color": "gray"
+      }
+    },
+    "sync": {
+      "preferred": "same_device",
+      "max_skew_ms": 10
+    },
+    "temporal": {
+      "frames": 4,
+      "order": "newest_first"
+    },
+    "packing": [
+      {
+        "ch": 0,
+        "stream": "eye_right",
+        "t": 0
+      },
+      {
+        "ch": 1,
+        "stream": "eye_left",
+        "t": 0
+      },
+      {
+        "ch": 2,
+        "stream": "eye_right",
+        "t": 1
+      },
+      {
+        "ch": 3,
+        "stream": "eye_left",
+        "t": 1
+      },
+      {
+        "ch": 4,
+        "stream": "eye_right",
+        "t": 2
+      },
+      {
+        "ch": 5,
+        "stream": "eye_left",
+        "t": 2
+      },
+      {
+        "ch": 6,
+        "stream": "eye_right",
+        "t": 3
+      },
+      {
+        "ch": 7,
+        "stream": "eye_left",
+        "t": 3
+      }
+    ],
+    "preprocess": {
+      "per_stream": {
+        "*": [
+          {
+            "op": "equalize_hist",
+            "v": 1,
+            "params": {}
+          }
+        ]
+      }
+    }
+  },
+  "output": {
+    "tensor": "output",
+    "outputs": [
+      {
+        "index": 0,
+        "name": "rightEyeY",
+        "kind": "gaze.pitch.right",
+        "decode": [
+          {
+            "op": "denorm_pm_deg",
+            "v": 1,
+            "params": {
+              "range_deg": 45.0
+            }
+          }
+        ],
+        "units": "deg",
+        "range": [
+          -45.0,
+          45.0
+        ],
+        "blendable": true,
+        "confidence": null
+      },
+      {
+        "index": 1,
+        "name": "rightEyeX",
+        "kind": "gaze.yaw.right",
+        "decode": [
+          {
+            "op": "denorm_pm_deg",
+            "v": 1,
+            "params": {
+              "range_deg": 45.0
+            }
+          }
+        ],
+        "units": "deg",
+        "range": [
+          -45.0,
+          45.0
+        ],
+        "blendable": true,
+        "confidence": null
+      },
+      {
+        "index": 2,
+        "name": "rightEyeLid",
+        "kind": "lid.right",
+        "decode": [
+          {
+            "op": "clamp01",
+            "v": 1,
+            "params": {}
+          }
+        ],
+        "units": "norm",
+        "range": [
+          0.0,
+          1.0
+        ],
+        "blendable": true,
+        "confidence": null
+      },
+      {
+        "index": 3,
+        "name": "rightEyeWiden",
+        "kind": "eye.widen.right",
+        "decode": [
+          {
+            "op": "clamp01",
+            "v": 1,
+            "params": {}
+          }
+        ],
+        "units": "norm",
+        "range": [
+          0.0,
+          1.0
+        ],
+        "blendable": true,
+        "confidence": null
+      },
+      {
+        "index": 4,
+        "name": "rightEyeSquint",
+        "kind": "eye.squint.right",
+        "decode": [
+          {
+            "op": "clamp01",
+            "v": 1,
+            "params": {}
+          }
+        ],
+        "units": "norm",
+        "range": [
+          0.0,
+          1.0
+        ],
+        "blendable": true,
+        "confidence": null
+      },
+      {
+        "index": 5,
+        "name": "rightEyeBrow",
+        "kind": "brow.angry.right",
+        "decode": [
+          {
+            "op": "clamp01",
+            "v": 1,
+            "params": {}
+          }
+        ],
+        "units": "norm",
+        "range": [
+          0.0,
+          1.0
+        ],
+        "blendable": true,
+        "confidence": null
+      },
+      {
+        "index": 6,
+        "name": "leftEyeY",
+        "kind": "gaze.pitch.left",
+        "decode": [
+          {
+            "op": "denorm_pm_deg",
+            "v": 1,
+            "params": {
+              "range_deg": 45.0
+            }
+          }
+        ],
+        "units": "deg",
+        "range": [
+          -45.0,
+          45.0
+        ],
+        "blendable": true,
+        "confidence": null
+      },
+      {
+        "index": 7,
+        "name": "leftEyeX",
+        "kind": "gaze.yaw.left",
+        "decode": [
+          {
+            "op": "denorm_pm_deg",
+            "v": 1,
+            "params": {
+              "range_deg": 45.0
+            }
+          }
+        ],
+        "units": "deg",
+        "range": [
+          -45.0,
+          45.0
+        ],
+        "blendable": true,
+        "confidence": null
+      },
+      {
+        "index": 8,
+        "name": "leftEyeLid",
+        "kind": "lid.left",
+        "decode": [
+          {
+            "op": "clamp01",
+            "v": 1,
+            "params": {}
+          }
+        ],
+        "units": "norm",
+        "range": [
+          0.0,
+          1.0
+        ],
+        "blendable": true,
+        "confidence": null
+      },
+      {
+        "index": 9,
+        "name": "leftEyeWiden",
+        "kind": "eye.widen.left",
+        "decode": [
+          {
+            "op": "clamp01",
+            "v": 1,
+            "params": {}
+          }
+        ],
+        "units": "norm",
+        "range": [
+          0.0,
+          1.0
+        ],
+        "blendable": true,
+        "confidence": null
+      },
+      {
+        "index": 10,
+        "name": "leftEyeSquint",
+        "kind": "eye.squint.left",
+        "decode": [
+          {
+            "op": "clamp01",
+            "v": 1,
+            "params": {}
+          }
+        ],
+        "units": "norm",
+        "range": [
+          0.0,
+          1.0
+        ],
+        "blendable": true,
+        "confidence": null
+      },
+      {
+        "index": 11,
+        "name": "leftEyeBrow",
+        "kind": "brow.angry.left",
+        "decode": [
+          {
+            "op": "clamp01",
+            "v": 1,
+            "params": {}
+          }
+        ],
+        "units": "norm",
+        "range": [
+          0.0,
+          1.0
+        ],
+        "blendable": true,
+        "confidence": null
+      },
+      {
+        "index": 12,
+        "name": "combinedEyeWiden",
+        "kind": "eye.widen",
+        "decode": [
+          {
+            "op": "clamp01",
+            "v": 1,
+            "params": {}
+          }
+        ],
+        "units": "norm",
+        "range": [
+          0.0,
+          1.0
+        ],
+        "blendable": true,
+        "confidence": null
+      },
+      {
+        "index": 13,
+        "name": "combinedEyeSquint",
+        "kind": "eye.squint",
+        "decode": [
+          {
+            "op": "clamp01",
+            "v": 1,
+            "params": {}
+          }
+        ],
+        "units": "norm",
+        "range": [
+          0.0,
+          1.0
+        ],
+        "blendable": true,
+        "confidence": null
+      },
+      {
+        "index": 14,
+        "name": "combinedEyeBrow",
+        "kind": "brow.angry",
+        "decode": [
+          {
+            "op": "clamp01",
+            "v": 1,
+            "params": {}
+          }
+        ],
+        "units": "norm",
+        "range": [
+          0.0,
+          1.0
+        ],
+        "blendable": true,
+        "confidence": null
+      }
+    ],
+    "post": []
+  },
+  "runtime": {
+    "batch": "dynamic",
+    "warmup_frames": 4
+  }
+}

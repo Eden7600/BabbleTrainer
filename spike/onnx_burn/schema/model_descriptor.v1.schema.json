@@ -1,0 +1,160 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://babble.diy/schemas/model_descriptor.v1.schema.json",
+  "$comment": "Baballonia model descriptor schema 1. Source of truth lives in the Baballonia repo (src/Baballonia.Descriptors/Schema/); BabbleTrainer vendors a copy pinned by sha256 (P4 sync test). Strict on structure, permissive on unknown extra fields (forward compat).",
+  "type": "object",
+  "required": ["schema", "model", "input", "output"],
+  "properties": {
+    "schema": { "type": "integer", "minimum": 1 },
+    "provenance": {
+      "type": "object",
+      "properties": {
+        "trainer": { "$ref": "#/definitions/tool" },
+        "capture_app": { "$ref": "#/definitions/tool" },
+        "created_utc": { "type": "string" },
+        "dataset_id": { "type": "string" }
+      }
+    },
+    "model": {
+      "type": "object",
+      "required": ["family", "roles"],
+      "properties": {
+        "family": { "type": "string" },
+        "revision": { "type": "integer" },
+        "roles": { "type": "array", "items": { "type": "string" }, "minItems": 1 }
+      }
+    },
+    "input": {
+      "type": "object",
+      "required": ["tensor", "layout", "dtype", "width", "height", "channels", "streams", "packing"],
+      "properties": {
+        "tensor": { "type": "string" },
+        "layout": { "type": "string", "enum": ["NCHW", "NHWC"] },
+        "dtype": { "type": "string" },
+        "width": { "type": "integer", "minimum": 1 },
+        "height": { "type": "integer", "minimum": 1 },
+        "channels": { "type": "integer", "minimum": 1 },
+        "range": { "type": "array", "items": { "type": "number" }, "minItems": 2, "maxItems": 2 },
+        "normalization": {
+          "type": "object",
+          "properties": {
+            "scale": { "type": ["string", "number", "null"] },
+            "mean": { "type": ["array", "null"], "items": { "type": "number" } },
+            "std": { "type": ["array", "null"], "items": { "type": "number" } }
+          }
+        },
+        "streams": {
+          "type": "object",
+          "minProperties": 1,
+          "additionalProperties": {
+            "type": "object",
+            "required": ["kind"],
+            "properties": {
+              "kind": { "type": "string" },
+              "color": { "type": "string" }
+            }
+          }
+        },
+        "sync": {
+          "type": "object",
+          "properties": {
+            "preferred": { "type": "string" },
+            "max_skew_ms": { "type": "number" }
+          }
+        },
+        "temporal": {
+          "type": "object",
+          "required": ["frames"],
+          "properties": {
+            "frames": { "type": "integer", "minimum": 1 },
+            "order": { "type": "string", "enum": ["newest_first", "oldest_first"] }
+          }
+        },
+        "packing": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "required": ["ch", "stream"],
+            "properties": {
+              "ch": { "type": "integer", "minimum": 0 },
+              "stream": { "type": "string" },
+              "t": { "type": "integer", "minimum": 0 }
+            }
+          }
+        },
+        "preprocess": {
+          "type": "object",
+          "properties": {
+            "per_stream": {
+              "type": "object",
+              "additionalProperties": { "type": "array", "items": { "$ref": "#/definitions/op" } }
+            }
+          }
+        }
+      }
+    },
+    "output": {
+      "type": "object",
+      "required": ["tensor", "outputs"],
+      "properties": {
+        "tensor": { "type": "string" },
+        "outputs": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["index", "name", "kind"],
+            "properties": {
+              "index": { "type": "integer", "minimum": 0 },
+              "name": { "type": "string" },
+              "kind": { "type": "string" },
+              "decode": { "type": "array", "items": { "$ref": "#/definitions/op" } },
+              "units": { "type": "string" },
+              "range": { "type": "array", "items": { "type": "number" }, "minItems": 2, "maxItems": 2 },
+              "blendable": { "type": "boolean" },
+              "confidence": { "type": ["string", "null"] },
+              "shape": { "type": "array", "items": { "type": "integer" } },
+              "consumer": { "type": "string" }
+            }
+          }
+        },
+        "post": {
+          "type": "array",
+          "items": {
+            "allOf": [
+              { "$ref": "#/definitions/op" },
+              { "properties": { "applies_to": { "type": "string" } } }
+            ]
+          }
+        }
+      }
+    },
+    "runtime": {
+      "type": "object",
+      "properties": {
+        "min_app": { "type": "string" },
+        "batch": { "type": "string" },
+        "warmup_frames": { "type": "integer", "minimum": 0 }
+      }
+    }
+  },
+  "definitions": {
+    "tool": {
+      "type": "object",
+      "properties": {
+        "name": { "type": "string" },
+        "version": { "type": "string" },
+        "git": { "type": "string" }
+      }
+    },
+    "op": {
+      "type": "object",
+      "required": ["op", "v"],
+      "properties": {
+        "op": { "type": "string" },
+        "v": { "type": "integer", "minimum": 1 },
+        "params": { "type": "object" }
+      }
+    }
+  }
+}
