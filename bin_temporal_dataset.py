@@ -10,6 +10,7 @@ from torch.utils.data import Dataset
 
 import config as C
 import bin_reader as BR
+import capture_manifest as CM
 
 USERDATA = C.ROOT / "userdata"
 DECRYPTED = USERDATA / "decrypted"
@@ -66,39 +67,87 @@ def build_index(bin_paths=None, index_path=INDEX_PATH, limit=None):
     print(f"Scanning {len(bin_paths)} bins for temporal dual-eye samples...")
 
     bin_ids, positions, sides, labels, gazes, expr_unlabeleds = [], [], [], [], [], []
+    masks, roles, blocks, routines, times = [], [], [], [], []
+    all_segments, all_times, manifests, reviewed_holds = [], [], [], []
+    all_excluded, omitted_holds = [], 0
     rec_offsets = []       
     bin_rec_start = [0]    
 
     for bid, path in enumerate(bin_paths):
+        manifest = CM.read_manifest(path)
+        manifests.append(manifest is not None)
+        if manifest:
+            for hold in manifest["raw"].get("reviewed_holds", []):
+                if manifest["excluded"][hold["start_record"]:hold["end_record_exclusive"]].any():
+                    omitted_holds += 1
+                else:
+                    reviewed_holds.append(dict(bin_id=bid, **hold))
         n_before = len(bin_ids)
         pos = 0
         with open(path, "rb") as f:
             while True:
                 off = f.tell()
                 hdr = f.read(BR.FRAME_SIZE)
-                if len(hdr) < BR.FRAME_SIZE:
+                if not hdr:
                     break
+                if len(hdr) < BR.FRAME_SIZE:
+                    raise ValueError("Truncated capture header")
                 d = dict(zip(BR.FIELDS, struct.unpack(BR.FRAME_FMT, hdr)))
+                if not all(np.isfinite(d[key]) for key in BR.FIELDS[:16]):
+                    raise ValueError("Capture contains non-finite target fields")
                 jl, jr = d["jpeg_len_left"], d["jpeg_len_right"]
                 if jl < 0 or jr < 0 or jl > BR.MAX_JPEG or jr > BR.MAX_JPEG:
-                    break
+                    raise ValueError("Invalid JPEG lengths in capture")
                 lj = f.read(jl)
                 rj = f.read(jr)
                 if len(lj) != jl or len(rj) != jr:
-                    break
+                    raise ValueError("Truncated capture image")
                 rec_offsets.append(off)
-                if int(d["routine_state"]) & BR.FLAG_GOOD_DATA:
+                if manifest is not None and pos >= manifest["record_count"]:
+                    raise ValueError("Sidecar record count is smaller than binary")
+                # Legacy context must still stop at a pose/routine change.
+                legacy_key = tuple(d[k] for k in ("routine_state", "left_lid", "right_lid", "widen", "squint", "brow_angry"))
+                if pos == 0:
+                    legacy_segment, previous_key = 0, legacy_key
+                elif legacy_key != previous_key:
+                    legacy_segment += 1
+                previous_key = legacy_key
+                all_segments.append(int(manifest["segment"][pos]) if manifest else legacy_segment)
+                all_times.append(float(manifest["timestamps"][pos]) if manifest else float(d["timestamp"]))
+                excluded = bool(manifest["excluded"][pos]) if manifest else False
+                all_excluded.append(excluded)
+                if not excluded and int(d["routine_state"]) & BR.FLAG_GOOD_DATA:
                     lt, rt, gv = BR.frame_targets_dual(d, mirror_side=C.TRAIN_MIRROR_BIN_SIDE)
                     # Freeform gaze section (look at the dot with random faces) 
                     # Used for gaze + the unlabeled expr stream
                     eu = 1.0 if BR.is_expr_unlabeled(d) else 0.0
-                    if not BR.is_blank(BR.decode_eye(lj)):
-                        bin_ids.append(bid); positions.append(pos); sides.append(0)
-                        labels.append(lt); gazes.append(gv); expr_unlabeleds.append(eu)
-                    if not BR.is_blank(BR.decode_eye(rj)):
-                        bin_ids.append(bid); positions.append(pos); sides.append(1)
-                        labels.append(rt); gazes.append(gv); expr_unlabeleds.append(eu)
+                    for side, jpeg, target in ((0, lj, lt), (1, rj, rt)):
+                        if BR.is_blank(BR.decode_eye(jpeg)):
+                            continue
+                        validity = np.ones(6, bool)
+                        validity[:2] = gv > .5
+                        if eu > .5:
+                            validity[2:] = False
+                        if manifest is not None:
+                            offset = 0 if side == C.TRAIN_MIRROR_BIN_SIDE else 6
+                            validity &= manifest["masks"][pos, offset:offset + 6]
+                            if manifest["value_overrides"] is not None:
+                                values = manifest["value_overrides"][pos, offset:offset + 6].copy()
+                                if side == C.TRAIN_MIRROR_BIN_SIDE:
+                                    values[1] = 1 - values[1]
+                                target = np.where(np.isfinite(values), values, target)
+                        elif d["squint"] > .5:
+                            validity[2] = False
+                        bin_ids.append(bid); positions.append(pos); sides.append(side)
+                        labels.append(target); gazes.append(gv); expr_unlabeleds.append(eu)
+                        masks.append(validity)
+                        roles.append(int(manifest["role"][pos]) if manifest else -1)
+                        blocks.append(int(manifest["block"][pos]) if manifest else legacy_segment)
+                        routines.append(manifest["routines"][manifest["block"][pos]] if manifest else str(legacy_key))
+                        times.append(float(manifest["timestamps"][pos]) if manifest else float(d["timestamp"]))
                 pos += 1
+        if manifest and manifest["record_count"] != pos:
+            raise ValueError("Sidecar record count differs from decoded binary")
         bin_rec_start.append(len(rec_offsets))
         print(f"  [{bid + 1}/{len(bin_paths)}] {Path(path).name[:24]}... +{len(bin_ids) - n_before} eyes "
               f"({pos} records, total {len(bin_ids)})", flush=True)
@@ -108,9 +157,16 @@ def build_index(bin_paths=None, index_path=INDEX_PATH, limit=None):
              bin_id=np.array(bin_ids, dtype=np.int32),
              pos=np.array(positions, dtype=np.int32),
              side=np.array(sides, dtype=np.int8),
-             label=np.clip(np.array(labels, dtype=np.float32), 0.0, 1.0),
+             label=np.clip(np.array(labels, dtype=np.float32).reshape(-1, 6), 0.0, 1.0),
              gaze_valid=np.array(gazes, dtype=np.float32),
              expr_unlabeled=np.array(expr_unlabeleds, dtype=np.float32),
+             label_mask=np.array(masks, dtype=bool).reshape(-1, 6), role=np.array(roles, dtype=np.int8),
+             block=np.array(blocks, dtype=np.int32), routine=np.array(routines),
+             timestamp=np.array(times, dtype=np.float64),
+             rec_segment=np.array(all_segments, dtype=np.int32), independent=np.array(manifests),
+             rec_timestamp=np.array(all_times, dtype=np.float64), reviewed_holds=np.array(json.dumps(reviewed_holds)),
+             rec_excluded=np.array(all_excluded, bool),
+             omitted_reviewed_holds=np.array(omitted_holds),
              rec_offset=np.array(rec_offsets, dtype=np.int64),
              bin_rec_start=np.array(bin_rec_start, dtype=np.int64))
     _bins_json_for(index_path).write_text(json.dumps(bin_paths))
@@ -235,6 +291,13 @@ class BinTemporalDataset(Dataset):
             bin_user = [user_of(p) for p in self.bin_paths]
             keep_val = np.array([bin_user[b] in val_users for b in idx["bin_id"]])
             desc = f"{len(val_users) if split == 'val' else len(users) - len(val_users)} {split} users"
+        elif split_mode == "block":
+            if not idx["independent"].all():
+                raise ValueError("Independent block splitting requires a valid capture sidecar")
+            CM.validate_coverage(idx["role"], idx["routine"], idx["label_mask"],
+                                 reviewed=False)
+            keep_val = idx["role"] == 1
+            desc = f"independent-block {split}"
         elif split_mode == "frame":
             # per-frame holdout — used when tuning on a single bin (1 user, so a user-split
             # would leave one side empty). Val is an optimistic same-session sanity metric.
@@ -255,6 +318,8 @@ class BinTemporalDataset(Dataset):
         else:
             raise ValueError(f"split_mode must be 'user', 'frame', or 'frame_tail', got {split_mode!r}")
         mask = keep_val if split == "val" else ~keep_val
+        if split_mode == "block":
+            mask &= idx["role"] == (1 if split == "val" else 0)
         if exclude_gaze:
             # With expressions gaze recordings, those frames have squint frames but a forced expr=0 label
             # The expr-section frames carry the real expr labels.
@@ -269,6 +334,16 @@ class BinTemporalDataset(Dataset):
         self.pos = idx["pos"][mask]
         self.side = idx["side"][mask]
         self.label = idx["label"][mask]
+        self.label_mask = idx["label_mask"][mask]
+        self.routine = idx["routine"][mask]
+        self.block = idx["block"][mask]
+        self.timestamp = idx["timestamp"][mask]
+        self.rec_segment = idx["rec_segment"]
+        self.rec_timestamp = idx["rec_timestamp"]
+        self.rec_excluded = idx["rec_excluded"] if "rec_excluded" in idx.files else np.zeros(len(self.rec_timestamp), bool)
+        self.omitted_reviewed_holds = int(idx["omitted_reviewed_holds"]) if "omitted_reviewed_holds" in idx.files else 0
+        self.reviewed_holds = json.loads(str(idx["reviewed_holds"]))
+        self.independent = split_mode == "block"
         self.gaze_valid = idx["gaze_valid"][mask]
         eu_all = idx["expr_unlabeled"] if "expr_unlabeled" in idx.files else np.zeros(len(idx["bin_id"]), np.float32)
         self.expr_unlabeled = eu_all[mask]           # free expression gaze section 
@@ -281,9 +356,10 @@ class BinTemporalDataset(Dataset):
         # intensity-mixup pools: the bin labels are binary, so synthesize mid range by blending a NEUTRAL stack and a full EXPRESSION stack 
         self.mixup = mixup and self.augment
         if self.mixup:
-            em = self.label[:, C.EXPR_SLICE[0]:C.EXPR_SLICE[1]].max(axis=1)
-            self.neutral_idx = np.where(em < C.EXPR_MIXUP_NEUTRAL_THRESH)[0]
-            self.expr_idx = np.where(em > C.EXPR_MIXUP_EXPR_THRESH)[0]
+            em = (self.label[:, 2:] * self.label_mask[:, 2:]).max(axis=1)
+            usable = self.label_mask[:, 2:].any(axis=1)
+            self.neutral_idx = np.where((em < C.EXPR_MIXUP_NEUTRAL_THRESH) & usable)[0]
+            self.expr_idx = np.where((em > C.EXPR_MIXUP_EXPR_THRESH) & usable)[0]
             if len(self.neutral_idx) == 0 or len(self.expr_idx) == 0:
                 self.mixup = False     # need both poles to interpolate
         print(f"BinTemporalDataset[{split}]: {len(self.label)} eye-samples, "
@@ -316,6 +392,8 @@ class BinTemporalDataset(Dataset):
         nrec = int(self.bin_rec_start[bid + 1]) - start
         if rpos >= nrec:
             return None
+        if self.rec_excluded[start + rpos]:
+            return None
         off = int(self.rec_offset[start + rpos])
         f = self._handle(bid)
         f.seek(off)
@@ -323,6 +401,8 @@ class BinTemporalDataset(Dataset):
         if len(hdr) < BR.FRAME_SIZE:
             return None
         d = struct.unpack(BR.FRAME_FMT, hdr)
+        if not int(d[-3]) & BR.FLAG_GOOD_DATA:
+            return None
         jl, jr = d[-2], d[-1]
         if side == 0:
             jpeg = f.read(jl)
@@ -344,7 +424,11 @@ class BinTemporalDataset(Dataset):
         """The TEMPORAL_FRAMES uint8 frames at (bid, pos, side): current + 3 predecessors, zero-padded."""
         S = C.DUAL_INPUT_SIZE
         zeros = np.zeros((S, S), dtype=np.uint8)
-        frames = [self._load_frame(bid, pos - k, side) for k in range(C.TEMPORAL_FRAMES)]
+        start = int(self.bin_rec_start[bid])
+        segment = self.rec_segment[start + pos]
+        frames = [self._load_frame(bid, pos - k, side)
+                  if pos >= k and self.rec_segment[start + pos - k] == segment else None
+                  for k in range(C.TEMPORAL_FRAMES)]
         return [fr if fr is not None else zeros for fr in frames]
 
     @staticmethod
@@ -374,31 +458,33 @@ class BinTemporalDataset(Dataset):
                 lam = random.random()
                 fa = self._load_frames(int(self.bin_id[ia]), int(self.pos[ia]), int(self.side[ia]))
                 fb = self._load_frames(int(self.bin_id[ib]), int(self.pos[ib]), int(self.side[ib]))
-                cur = _mixup_frames(fa, fb, lam, random.Random())
+                cur = _mixup_frames(fa, fb, lam, random)
                 lbl = ((1.0 - lam) * self.label[ia] + lam * self.label[ib]).astype(np.float32)
+                valid = self.label_mask[ia] & self.label_mask[ib]
+                valid[:2] = False
                 return (torch.from_numpy(cur), torch.from_numpy(lbl),
-                        torch.tensor(0.0, dtype=torch.float32))
+                        torch.tensor(0.0, dtype=torch.float32), torch.from_numpy(valid))
             # else: fall through to a plain sample
 
         label = torch.from_numpy(self.label[i].copy())
         gv = torch.tensor(float(self.gaze_valid[i]), dtype=torch.float32)
 
-        cur = self._stack(bid, pos, side, random.Random() if self.augment else None)
-        return torch.from_numpy(cur), label, gv
+        cur = self._stack(bid, pos, side, random if self.augment else None)
+        return torch.from_numpy(cur), label, gv, torch.from_numpy(self.label_mask[i].copy())
 
     def sampler_weights(self, active_boost: float = 4.0, gaze_boost: float = 4.0,
                         neutral_gaze_weight: float = None):
         """Oversample active-expression frames AND gaze-valid frames so both the sparse
         gaze head and the mostly-neutral expression channels get enough signal."""
         a, b = C.EXPR_SLICE
-        expr = self.label[:, a:b].max(axis=1).astype(np.float64)
+        expr = (self.label[:, a:b] * self.label_mask[:, a:b]).max(axis=1).astype(np.float64)
         w = 1.0 + active_boost * expr + gaze_boost * self.gaze_valid.astype(np.float64)
         ngw = C.EXPR_NEUTRAL_GAZE_WEIGHT if neutral_gaze_weight is None else neutral_gaze_weight
         if ngw != 1.0:
             neutral_gaze = ((self.gaze_valid > 0.5) & (expr < C.GAZE_EXPR_ACTIVE_THRESH)
                             & (self.expr_unlabeled < 0.5))   # gaze-valid, low expr label, not gazeexpr
             w[neutral_gaze] *= ngw
-        return w
+        return w * self.label_mask[:, a:b].any(axis=1)
 
     def gaze_sampler_weights(self, closed_ratio: float = None, lid_thresh: float = None,
                              expr_ratio: float = None):
@@ -407,10 +493,10 @@ class BinTemporalDataset(Dataset):
         closed_ratio = C.GAZE_CLOSED_RATIO if closed_ratio is None else closed_ratio
         expr_ratio = C.GAZE_EXPR_RATIO if expr_ratio is None else expr_ratio
         lid_thresh = C.GAZE_CLOSED_LID_THRESH if lid_thresh is None else lid_thresh
-        gaze = self.gaze_valid > 0.5
-        closed = (self.label[:, C.EXPR_SLICE[0]] > lid_thresh) & (~gaze)   # EyeLid (=1-lid) high, not gaze
+        gaze = (self.gaze_valid > 0.5) & self.label_mask[:, :2].any(axis=1)
+        closed = np.zeros(len(self.label), bool)  # Closed lids do not establish target-derived gaze.
         a, b = C.EXPR_SLICE
-        active = self.label[:, a:b].max(axis=1) > C.GAZE_EXPR_ACTIVE_THRESH
+        active = (self.label[:, a:b] * self.label_mask[:, a:b]).max(axis=1) > C.GAZE_EXPR_ACTIVE_THRESH
         expr_gaze = gaze & (active | (self.expr_unlabeled > 0.5))          # held squint/widen/brow + gazeexpr
         neut_gaze = gaze & (~expr_gaze)
         w = np.zeros(len(self.label), dtype=np.float64)
@@ -428,8 +514,20 @@ class BinTemporalDataset(Dataset):
         if neut_gaze.any():
             w[neut_gaze] = n_share / neut_gaze.sum()
         if w.sum() == 0:
-            w[:] = 1.0
+            raise ValueError("No valid gaze labels; repeat the gaze recording")
         return w
+
+    def ancestry(self, i, neighbor=False):
+        bid, pos, side = int(self.bin_id[i]), int(self.pos[i]), int(self.side[i])
+        start = int(self.bin_rec_start[bid])
+        segment = self.rec_segment[start + pos]
+        return {(bid, pos - k, side) for k in range(C.TEMPORAL_FRAMES + int(neighbor))
+                if pos >= k and not self.rec_excluded[start + pos - k] and self.rec_segment[start + pos - k] == segment}
+
+    def close(self):
+        for f in self._fh.values():
+            f.close()
+        self._fh.clear()
 
 
 class BinPairedEyeDataset(Dataset):
@@ -473,14 +571,53 @@ class BinPairedEyeDataset(Dataset):
         aug = self.base.augment
         # Independent augmentation per eye (the two eyes are different images); the evenness loss is a
         # gentle agree-gated pull, so this doubles as light L/R aug-consistency.
-        left = self.base._stack(b, p, self.canon_side, random.Random() if aug else None)
-        right = self.base._stack(b, p, self.mirror_side, random.Random() if aug else None)
+        left = self.base._stack(b, p, self.canon_side, random if aug else None)
+        right = self.base._stack(b, p, self.mirror_side, random if aug else None)
         ll = torch.from_numpy(self.base.label[ic].copy())
         rl = torch.from_numpy(self.base.label[im].copy())
-        return torch.from_numpy(left), torch.from_numpy(right), ll, rl
+        return (torch.from_numpy(left), torch.from_numpy(right), ll, rl,
+                torch.from_numpy(self.base.label_mask[ic].copy()),
+                torch.from_numpy(self.base.label_mask[im].copy()))
 
     def sampler_weights(self, active_boost: float = 4.0):
-        return 1.0 + active_boost * self._expr_max
+        valid = np.asarray([(self.base.label_mask[ic, 2:] & self.base.label_mask[im, 2:]).any()
+                            for _, _, ic, im in self.pairs])
+        return (1.0 + active_boost * self._expr_max) * valid
+
+
+class PartitionedUnlabeledDataset(Dataset):
+    """Keep original record identity and continuity for free-expression optimization."""
+    def __init__(self, base):
+        self.base = base
+        self.indices = np.flatnonzero(base.expr_unlabeled > .5)
+
+    def __len__(self):
+        return len(self.indices)
+
+    def __getitem__(self, idx):
+        i = int(self.indices[idx])
+        bid, pos, side = int(self.base.bin_id[i]), int(self.base.pos[i]), int(self.base.side[i])
+        frames = self.base._load_frames(bid, pos, side)
+        start = int(self.base.bin_rec_start[bid])
+        pair_ok = pos > 0 and self.base.rec_segment[start + pos] == self.base.rec_segment[start + pos - 1]
+        neighbor = self.base._load_frames(bid, pos - 1, side) if pair_ok else frames
+        geom = sample_geom(False, random)
+        return (torch.from_numpy(_frames_to_stack(_aug_stack(frames, random))),
+                torch.from_numpy(_frames_to_stack(_aug_weak(frames, random, geom))),
+                torch.from_numpy(_frames_to_stack(_aug_weak(neighbor, random, geom))),
+                torch.tensor(float(pair_ok)))
+
+
+def assert_independent(train, val):
+    train_records, val_records = set(), set()
+    for i in range(len(train)):
+        train_records.update(train.ancestry(i, neighbor=True))
+    for i in range(len(val)):
+        val_records.update(val.ancestry(i, neighbor=True))
+    if train_records & val_records:
+        raise ValueError("Training and validation share source images")
+    return {"training_source_images": len(train_records), "validation_source_images": len(val_records),
+            "overlap": 0}
 
 
 def _unlabeled_frames_from_bin(bin_path):
@@ -580,10 +717,10 @@ class FootageUnlabeledDataset(Dataset):
         cur_frames = self._frames(fi, side)
         pair_ok = 1.0 if fi >= 1 else 0.0
         if self.augment:
-            cur_strong = _frames_to_stack(_aug_stack(cur_frames, random.Random()))
-            g_weak = sample_geom(strong=False, rng=random.Random())
-            cur_weak = _frames_to_stack(_aug_weak(cur_frames, random.Random(), g_weak))
-            nbr_weak = (_frames_to_stack(_aug_weak(self._frames(fi - 1, side), random.Random(), g_weak))
+            cur_strong = _frames_to_stack(_aug_stack(cur_frames, random))
+            g_weak = sample_geom(strong=False, rng=random)
+            cur_weak = _frames_to_stack(_aug_weak(cur_frames, random, g_weak))
+            nbr_weak = (_frames_to_stack(_aug_weak(self._frames(fi - 1, side), random, g_weak))
                         if pair_ok else cur_weak.copy())
         else:
             cur_strong = cur_weak = _frames_to_stack(cur_frames)

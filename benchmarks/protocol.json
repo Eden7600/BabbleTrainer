@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "status": "draft",
+  "target_metric": "squint_mae",
+  "hardware": "",
+  "backend": "",
+  "dataset_sha256": "",
+  "baseline_sha256": "",
+  "candidate_sha256": "",
+  "license_review": "",
+  "minimum_independent_units": 10,
+  "clip_ids": [],
+  "expression_channels": ["left_lid", "left_widen", "left_squint", "left_brow", "right_lid", "right_widen", "right_squint", "right_brow"],
+  "gaze_axes": ["left_yaw", "left_pitch", "right_yaw", "right_pitch"]
+}
