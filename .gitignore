@@ -9,3 +9,13 @@
 /build
 /venv
 /dist
+
+# Test and benchmark bytecode stays local.
+__pycache__/
+*.py[cod]
+
+# Local research environment, caches and run outputs.
+/.venv
+/.cache
+/runs
+/benchmarks/*-results.json
