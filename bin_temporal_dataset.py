@@ -1,6 +1,8 @@
 import json
+import os
 import random
 import struct
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import cv2
@@ -53,6 +55,62 @@ def _bins_json_for(index_path):
     """The companion file listing the bin paths for a given index .npz."""
     p = Path(index_path)
     return p.with_name(p.stem + "_files.json")
+
+
+def _frames_for(index_path):
+    """The companion memory-mapped [records, 2, S, S] uint8 cache of decoded eye frames."""
+    p = Path(index_path)
+    return p.with_name(p.stem + "_frames.npy")
+
+
+def _decode_record(record, side):
+    """uint8 [S,S] gray frame (histeq'd, mirror eye flipped) from one raw record, or None if the record
+    is not good data or the eye is blank."""
+    d = struct.unpack(BR.FRAME_FMT, record[:BR.FRAME_SIZE])
+    if not int(d[-3]) & BR.FLAG_GOOD_DATA:
+        return None
+    jl, jr = d[-2], d[-1]
+    start = BR.FRAME_SIZE + (0 if side == 0 else jl)
+    jpeg = record[start:start + (jl if side == 0 else jr)]
+    if len(jpeg) < (jl if side == 0 else jr):
+        return None
+    eye = BR.decode_eye(jpeg)
+    if BR.is_blank(eye):
+        return None
+    S = C.DUAL_INPUT_SIZE
+    if eye.shape[:2] != (S, S):
+        eye = cv2.resize(eye, (S, S), interpolation=cv2.INTER_AREA)
+    eye = cv2.equalizeHist(eye)
+    if side == C.TRAIN_MIRROR_BIN_SIDE:
+        eye = cv2.flip(eye, 1)    # mirror this eye into canonical space
+    return eye
+
+
+def build_frame_cache(index_path):
+    """Decode every record's eyes once into a memory-mapped array. Training otherwise re-decodes ~500
+    JPEGs per batch and the GPU waits; DataLoader workers share this file through the OS page cache.
+    Unusable eyes stay all-zero, which an equalized real frame never is."""
+    idx = np.load(index_path)
+    offsets, starts = idx["rec_offset"], idx["bin_rec_start"]
+    S = C.DUAL_INPUT_SIZE
+    cache = np.lib.format.open_memmap(_frames_for(index_path), mode="w+", dtype=np.uint8,
+                                      shape=(len(offsets), 2, S, S))
+    for bid, path in enumerate(json.loads(_bins_json_for(index_path).read_text())):
+        data = Path(path).read_bytes()
+        a, b = int(starts[bid]), int(starts[bid + 1])
+        ends = list(offsets[a + 1:b]) + [len(data)]
+
+        def decode(k):
+            record = data[int(offsets[a + k]):int(ends[k])]
+            for side in (0, 1):
+                eye = _decode_record(record, side)
+                if eye is not None:
+                    cache[a + k, side] = eye
+        # cv2 decoding releases the GIL, so threads use every core without copying the capture per process.
+        with ThreadPoolExecutor(max_workers=os.cpu_count()) as pool:
+            list(pool.map(decode, range(b - a)))
+    cache.flush()
+    del cache
 
 
 
@@ -170,6 +228,7 @@ def build_index(bin_paths=None, index_path=INDEX_PATH, limit=None):
              rec_offset=np.array(rec_offsets, dtype=np.int64),
              bin_rec_start=np.array(bin_rec_start, dtype=np.int64))
     _bins_json_for(index_path).write_text(json.dumps(bin_paths))
+    build_frame_cache(index_path)
     users = sorted({user_of(p) for p in bin_paths})
     ng = int(np.sum(gazes)) if gazes else 0
     print(f"\nIndex: {len(bin_ids)} eye-samples ({ng} gaze-valid) across {len(bin_paths)} bins, "
@@ -350,6 +409,9 @@ class BinTemporalDataset(Dataset):
         self.rec_offset = idx["rec_offset"]          # shared across all samples 
         self.bin_rec_start = idx["bin_rec_start"]
         self._fh = {}                                # per-worker lazy file handles
+        cache = _frames_for(index_path)
+        self._frames_path = cache if cache.exists() else None
+        self._frames = None                          # per-worker lazy memory map
         if aug_mode not in ("expr", "gaze"):
             raise ValueError(f"aug_mode must be 'expr' or 'gaze', got {aug_mode!r}")
         self.aug_mode = aug_mode                     # 'expr' -> our strong aug; 'gaze' -> BabbleTrainer's
@@ -374,6 +436,7 @@ class BinTemporalDataset(Dataset):
         # (Windows spawn) — workers reopen them lazily in _handle().
         s = self.__dict__.copy()
         s["_fh"] = {}
+        s["_frames"] = None
         return s
 
     def _handle(self, bid):
@@ -394,31 +457,19 @@ class BinTemporalDataset(Dataset):
             return None
         if self.rec_excluded[start + rpos]:
             return None
+        if self._frames_path is not None:
+            if self._frames is None:
+                self._frames = np.load(self._frames_path, mmap_mode="r")
+            eye = self._frames[start + rpos, side]
+            return np.array(eye) if eye.any() else None
         off = int(self.rec_offset[start + rpos])
         f = self._handle(bid)
         f.seek(off)
         hdr = f.read(BR.FRAME_SIZE)
         if len(hdr) < BR.FRAME_SIZE:
             return None
-        d = struct.unpack(BR.FRAME_FMT, hdr)
-        if not int(d[-3]) & BR.FLAG_GOOD_DATA:
-            return None
-        jl, jr = d[-2], d[-1]
-        if side == 0:
-            jpeg = f.read(jl)
-        else:
-            f.seek(jl, 1)             # skip the left jpeg
-            jpeg = f.read(jr)
-        eye = BR.decode_eye(jpeg)
-        if BR.is_blank(eye):
-            return None
-        S = C.DUAL_INPUT_SIZE
-        if eye.shape[:2] != (S, S):
-            eye = cv2.resize(eye, (S, S), interpolation=cv2.INTER_AREA)
-        eye = cv2.equalizeHist(eye)
-        if side == C.TRAIN_MIRROR_BIN_SIDE:
-            eye = cv2.flip(eye, 1)    # mirror this eye into canonical space
-        return eye
+        jl, jr = struct.unpack(BR.FRAME_FMT, hdr)[-2:]
+        return _decode_record(hdr + f.read(jl + jr), side)
 
     def _load_frames(self, bid, pos, side):
         """The TEMPORAL_FRAMES uint8 frames at (bid, pos, side): current + 3 predecessors, zero-padded."""
@@ -528,6 +579,7 @@ class BinTemporalDataset(Dataset):
         for f in self._fh.values():
             f.close()
         self._fh.clear()
+        self._frames = None   # release the memory map so Windows can delete the cache file
 
 
 class BinPairedEyeDataset(Dataset):

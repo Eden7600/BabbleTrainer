@@ -30,3 +30,27 @@ class CaptureManifestTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class FrameCacheTests(unittest.TestCase):
+    def test_cached_frames_match_decoding_from_the_capture(self):
+        import numpy as np
+        import bin_temporal_dataset as TD
+        with tempfile.TemporaryDirectory() as tmp:
+            capture, _ = make_capture(Path(tmp))
+            index = Path(tmp) / "index.npz"
+            TD.build_index([capture], index)
+            cached = TD.BinTemporalDataset("train", index, split_mode="block", augment=False)
+            direct = TD.BinTemporalDataset("train", index, split_mode="block", augment=False)
+            direct._frames_path = None
+            try:
+                self.assertIsNotNone(cached._frames_path)
+                n = int(cached.bin_rec_start[1])
+                for pos in range(-1, n + 1):
+                    for side in (0, 1):
+                        a, b = cached._load_frame(0, pos, side), direct._load_frame(0, pos, side)
+                        self.assertEqual(a is None, b is None, (pos, side))
+                        if a is not None:
+                            np.testing.assert_array_equal(a, b)
+            finally:
+                cached.close(); direct.close()
