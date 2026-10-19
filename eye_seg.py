@@ -1,7 +1,7 @@
 """Eye-region segmentation (background, sclera, iris, pupil) at Babble's 128x128 input, and the lid/pupil
 geometry derived from it. Research tool: trained on OpenEDS, which is research-only (never ship these weights).
 
-  DEVICE=cuda python eye_seg.py train E:/datasets/openEDS --out runs/seg
+  python eye_seg.py train E:/datasets/openEDS --out runs/seg
 """
 import argparse
 import json

@@ -6,14 +6,12 @@ import torch
 
 
 def get_device():
-    """Prefer CUDA, then DirectML; CPU remains an explicit or initialization-time choice."""
+    """Prefer DirectML when available; CPU remains an explicit or initialization-time choice."""
     requested = os.environ.get("DEVICE", "auto").strip().lower()
     if requested == "cpu":
         return torch.device("cpu")
-    if requested == "cuda" or (requested in ("", "auto") and torch.cuda.is_available()):
-        return torch.device("cuda")
     if requested not in ("", "auto", "directml"):
-        raise ValueError("DEVICE must be cpu, cuda, auto, or directml")
+        raise ValueError("DEVICE must be cpu, auto, or directml")
     try:
         import torch_directml
         return torch_directml.device()

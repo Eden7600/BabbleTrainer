@@ -270,11 +270,7 @@ class ReliabilityTests(unittest.TestCase):
 
     def test_backend_selection_and_explicit_cpu(self):
         import device
-        with patch.dict(os.environ, {}, clear=True), patch("torch.cuda.is_available", return_value=True):
-            self.assertEqual(device.get_device().type, "cuda")   # auto prefers CUDA when present
-            os.environ["DEVICE"] = "cpu"
-            self.assertEqual(device.get_device().type, "cpu")
-        with patch.dict(os.environ, {}, clear=True), patch.dict(sys.modules, {"torch_directml": None}),                 patch("torch.cuda.is_available", return_value=False):
+        with patch.dict(os.environ, {}, clear=True), patch.dict(sys.modules, {"torch_directml": None}):
             self.assertEqual(device.get_device().type, "cpu")
             for requested in ("auto", "cpu", ""):
                 os.environ["DEVICE"] = requested
@@ -286,7 +282,8 @@ class ReliabilityTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 device.get_device()
         from types import SimpleNamespace
-        with patch.dict(os.environ, {}, clear=True), patch("torch.cuda.is_available", return_value=False),                 patch.dict(sys.modules, {"torch_directml": SimpleNamespace(device=lambda: torch.device("privateuseone"))}):
+        with patch.dict(os.environ, {}, clear=True), patch.dict(sys.modules,
+                {"torch_directml": SimpleNamespace(device=lambda: torch.device("privateuseone"))}):
             self.assertEqual(device.get_device().type, "privateuseone")
             os.environ["DEVICE"] = "cpu"
             self.assertEqual(device.get_device().type, "cpu")

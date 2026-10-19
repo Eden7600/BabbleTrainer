@@ -3,7 +3,7 @@
 Each variant fine-tunes from the shipped gaze checkpoint on one session's train blocks, selects on that
 session's validation blocks, and is scored on the other session's validation blocks (a headset refit).
 
-  DEVICE=cuda python benchmarks/gaze_arch_experiment.py CAPTURE_DIR CAPTURE_DIR --init dist/.../gaze_model_best.pt
+  python benchmarks/gaze_arch_experiment.py CAPTURE_DIR CAPTURE_DIR --init dist/.../gaze_model_best.pt
 """
 import argparse
 import json

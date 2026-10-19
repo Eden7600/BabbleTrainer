@@ -32,13 +32,13 @@ def main():
                         "--distpath", str(tmp / "dist"), "--workpath", str(tmp / "build"),
                         str(root / "BabbleTrainer.spec")], cwd=root, check=True)
         exe_name = "BabbleTrainer.exe" if sys.platform == "win32" else "BabbleTrainer"
-        bundle = tmp / "dist" / "BabbleTrainer"
-        exe = bundle / exe_name
+        exe = tmp / "dist" / exe_name
         capabilities = json.loads(subprocess.check_output([str(exe), "--capabilities"], text=True))
         if (capabilities.get("protocol_version") != 1 or capabilities.get("capture_schema_version") != 1
                 or capabilities.get("review_schema_version") != 1):
             raise ValueError("Frozen trainer capability mismatch")
-        shutil.copytree(bundle, output)  # exe plus its _internal runtime folder
+        output.mkdir(parents=True)
+        shutil.copy2(exe, output / exe_name)
         for name in pretrained:
             shutil.copy2(assets / name, output / name)
     git = ["git", "-c", f"safe.directory={root.as_posix()}", "-C", str(root)]

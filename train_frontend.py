@@ -13,7 +13,7 @@ import training_progress as Progress
 CAPABILITIES = {"schema_version": 1, "protocol_version": 1, "capture_schema_version": 1,
                 "progress_json": True, "artifact_manifest": "training-artifact.json",
                 "independent_blocks": True, "explicit_legacy": True,
-                "default_device": "auto", "auto_device_priority": ["cuda", "directml", "cpu"],
+                "default_device": "auto", "auto_device_priority": ["directml", "cpu"],
                 "review_schema_version": 1, "temporal_exclusions": False}
 
 
@@ -223,7 +223,7 @@ def train(args, run_id):
                 pretrained={"expression": sha256(expr_init), "gaze": sha256(gaze_init),
                             "presence": sha256(presence_path) if presence is not None else None},
                 seed=C.SEED, event_metrics="unavailable_without_reviewed_events",
-                training_backend={"privateuseone": "directml"}.get(Dev.get_device().type, Dev.get_device().type))
+                training_backend="directml" if Dev.get_device().type == "privateuseone" else "cpu")
             report["expression_label_coverage"] = coverage
             report["auto_labels"] = auto_labels
             report["missing_expression_endpoints"] = missing_endpoints

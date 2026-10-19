@@ -5,16 +5,9 @@ Binaries = []
 import sys
 
 if sys.platform == 'win32':
-    import importlib.util
+    import os
     from PyInstaller.utils.hooks import collect_dynamic_libs
-    # DirectML builds bundle its DLLs; CUDA builds get theirs from torch's own hooks.
-    if importlib.util.find_spec('torch_directml'):
-        Binaries = collect_dynamic_libs('torch_directml')
-    # torchvision >= 0.29 ships its ops as *_stable.pyd, which PyInstaller's hook misses
-    # ("operator torchvision::nms does not exist"); bundle its native files explicitly.
-    from pathlib import Path
-    vision = Path(importlib.util.find_spec('torchvision').origin).parent
-    Binaries += [(str(f), 'torchvision') for f in vision.iterdir() if f.suffix in ('.pyd', '.dll')]
+    Binaries = collect_dynamic_libs('torch_directml')
     print(Binaries)
 
 a = Analysis(
@@ -40,18 +33,19 @@ a = Analysis(
 )
 pyz = PYZ(a.pure)
 
-# One folder (exe + _internal) rather than one file: CUDA torch is several GB, and a one-file exe
-# would unpack all of it on every training run.
 exe = EXE(
     pyz,
     a.scripts,
+    a.binaries,
+    a.datas,
     [],
-    exclude_binaries=True,
     name='BabbleTrainer',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=False,
+    upx=True,
+    upx_exclude=[],
+    runtime_tmpdir=None,
     console=True,
     disable_windowed_traceback=False,
     argv_emulation=False,
@@ -59,4 +53,3 @@ exe = EXE(
     codesign_identity=None,
     entitlements_file=None,
 )
-coll = COLLECT(exe, a.binaries, a.datas, strip=False, upx=False, name='BabbleTrainer')
