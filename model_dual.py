@@ -18,8 +18,9 @@ class GlobalMaxPool2d(nn.Module):
 
 class MicroChad(nn.Module):
 
-    def __init__(self, out_count=2, in_ch=None):
+    def __init__(self, out_count=2, in_ch=None, spatial=False):
         super().__init__()
+        self.spatial = spatial
         in_ch = C.TEMPORAL_FRAMES if in_ch is None else in_ch
         self.conv1 = nn.Conv2d(in_ch, 14, kernel_size=3, stride=1, padding=1)
         self.conv2 = nn.Conv2d(14, 21, kernel_size=3, stride=1, padding=1)
@@ -27,7 +28,7 @@ class MicroChad(nn.Module):
         self.conv4 = nn.Conv2d(32, 47, kernel_size=3, stride=1, padding=1)
         self.conv5 = nn.Conv2d(47, 70, kernel_size=3, stride=1, padding=1)
         self.conv6 = nn.Conv2d(70, 106, kernel_size=3, stride=1, padding=1)
-        self.fc_gaze = nn.Linear(106, out_count)
+        self.fc_gaze = nn.Linear(106 * 4 * 4 if spatial else 106, out_count)
         self.pool = nn.MaxPool2d(kernel_size=2, stride=2, padding=0, dilation=1, ceil_mode=False)
         self.adaptive = GlobalMaxPool2d()
         self.act = nn.ReLU(inplace=True)
@@ -40,7 +41,7 @@ class MicroChad(nn.Module):
         x = self.pool(self.act(self.conv4(x)))
         x = self.pool(self.act(self.conv5(x)))
         x = self.act(self.conv6(x))
-        x = torch.flatten(self.adaptive(x), 1)
+        x = torch.flatten(x if self.spatial else self.adaptive(x), 1)
         return self.sigmoid(self.fc_gaze(x))
 
 
@@ -88,7 +89,7 @@ class DualTaskTower(nn.Module):
 def build_eye_tower(backbone: str | None = None, pretrained: bool = True) -> nn.Module:
     backbone = backbone or C.BACKBONE
     expr = _build_expr_tower(backbone, pretrained, EXPR_OUT)
-    gaze = MicroChad(out_count=GAZE_OUT)
+    gaze = MicroChad(out_count=GAZE_OUT, spatial=C.GAZE_SPATIAL)
     return DualTaskTower(expr, gaze)
 
 
@@ -96,8 +97,18 @@ def build_expr_net(backbone: str | None = None, pretrained: bool = True) -> nn.M
     return _build_expr_tower(backbone or C.BACKBONE, pretrained, EXPR_OUT)
 
 
-def build_gaze_net() -> nn.Module:
-    return MicroChad(out_count=GAZE_OUT)
+def build_gaze_net(spatial=None) -> nn.Module:
+    return MicroChad(out_count=GAZE_OUT, spatial=C.GAZE_SPATIAL if spatial is None else spatial)
+
+
+def gaze_state(ckpt_path):
+    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=True)
+    return ckpt.get("gaze", ckpt.get("student", ckpt)) if isinstance(ckpt, dict) else ckpt
+
+
+def gaze_net_for(state_dict) -> nn.Module:
+    """A MicroChad whose head matches a saved state dict (max-pooled or spatial)."""
+    return MicroChad(out_count=GAZE_OUT, spatial=state_dict["fc_gaze.weight"].shape[1] != 106)
 
 
 def warm_start_from(net, ckpt_path) -> int:
@@ -111,11 +122,15 @@ def warm_start_from(net, ckpt_path) -> int:
 
 
 def warm_start_gaze(gaze_net, ckpt_path) -> int:
-    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=True)
-    src = ckpt.get("gaze", ckpt.get("student", ckpt)) if isinstance(ckpt, dict) else ckpt
-    gaze_net.load_state_dict(src)
-    print(f"warm-start gaze: loaded {len(src)} MicroChad tensors from {Path(ckpt_path).name}", flush=True)
-    return len(src)
+    src = gaze_state(ckpt_path)
+    own = gaze_net.state_dict()
+    # A max-pooled checkpoint can seed a spatial net: every conv carries over, only the head starts fresh.
+    keep = {k: v for k, v in src.items() if own[k].shape == v.shape}
+    gaze_net.load_state_dict(keep, strict=len(keep) == len(own))
+    fresh = sorted(set(own) - set(keep))
+    print(f"warm-start gaze: loaded {len(keep)} MicroChad tensors from {Path(ckpt_path).name}"
+          + (f"; fresh: {', '.join(fresh)}" if fresh else ""), flush=True)
+    return len(keep)
 
 
 def expr_feat_dim(expr_net) -> int:
@@ -165,11 +180,40 @@ def build_consensus_heads(feat_dim, groups=None, hidden=None) -> nn.ModuleList:
     return nn.ModuleList([ConsensusHead(feat_dim, len(g), hidden) for g in groups])
 
 
+class EyePresence(nn.Module):
+    """Headset-worn probability for one equalized 128x128 eye frame (the segmentation net's encoder + head)."""
+
+    def __init__(self, seg):
+        super().__init__()
+        self.seg = seg
+
+    def forward(self, x):
+        return torch.sigmoid(self.seg.presence_logit(x))[:, None]
+
+
+def load_presence(path) -> nn.Module:
+    from eye_seg import load_seg
+    seg = load_seg(path)
+    if not seg.has_presence:
+        raise ValueError(f"{path} has no presence head; train it with eye_seg.py presence")
+    return EyePresence(seg).eval()
+
+
+def presence_outputs(presence, x):
+    """(B, 2) presence in output side order, from each eye's newest frame; mirrors MergedDualEye's side logic."""
+    left = presence(x[:, C.EXPORT_NOFLIP_CH[0]:C.EXPORT_NOFLIP_CH[0] + 1])   # the un-flipped eye feeds leftEye*
+    right = presence(x[:, C.EXPORT_FLIP_CH[0]:C.EXPORT_FLIP_CH[0] + 1])
+    if C.SWAP_OUTPUT_SIDES:
+        right, left = left, right
+    return torch.cat([right, left] if C.OUTPUT_SIDE_ORDER[0] == "right" else [left, right], dim=1)
+
+
 class MergedDualEye(nn.Module):
-    def __init__(self, tower: nn.Module, consensus: nn.ModuleList | None = None):
+    def __init__(self, tower: nn.Module, consensus: nn.ModuleList | None = None, presence: nn.Module | None = None):
         super().__init__()
         self.tower = tower
         self.consensus = consensus
+        self.presence = presence
         self.right_first = (C.OUTPUT_SIDE_ORDER[0] == "right")
         # Channel fusion (deployment): both eyes emit one shared value for these EXPR channels.
         self.fuse_source = C.EXPR_FUSE_SOURCE
@@ -210,7 +254,10 @@ class MergedDualEye(nn.Module):
 
     def forward(self, x):
         noflip = x[:, C.EXPORT_NOFLIP_CH, :, :]                      # canonical-space eye -> leftEye*
-        flipped = torch.flip(x[:, C.EXPORT_FLIP_CH, :, :], dims=[-1])  # mirror into canonical -> rightEye*
+        mirror_input = x[:, C.EXPORT_FLIP_CH, :, :]
+        # torch-directml 0.2.5 can crash natively on flip; validation needs no GPU mirror kernel.
+        flipped = (torch.flip(mirror_input.cpu(), dims=[-1]).to(x.device)
+                   if x.device.type == "privateuseone" else torch.flip(mirror_input, dims=[-1]))
         out_left, feat_left = self._eye(noflip)
         out_right, feat_right = self._eye(flipped)
         out_right = torch.cat([out_right[:, 0:1], 1.0 - out_right[:, 1:2], out_right[:, 2:]], dim=1)
@@ -218,11 +265,12 @@ class MergedDualEye(nn.Module):
         if self.fuse_channels and self.fuse_source == "mean":
             right_side, left_side = self._fuse_mean(right_side, left_side)
         merged = torch.cat([right_side, left_side] if self.right_first else [left_side, right_side], dim=1)
-        merged = merged.clamp(0.0, 1.0)
-        if self.consensus is None:
-            return merged
-        combined = torch.cat([h(feat_left, feat_right) for h in self.consensus], dim=1).clamp(0.0, 1.0)
-        full = torch.cat([merged, combined], dim=1)
-        if self.gather_idx is not None:
-            full = full.index_select(1, self.gather_idx)
+        full = merged.clamp(0.0, 1.0)
+        if self.consensus is not None:
+            combined = torch.cat([h(feat_left, feat_right) for h in self.consensus], dim=1).clamp(0.0, 1.0)
+            full = torch.cat([full, combined], dim=1)
+            if self.gather_idx is not None:
+                full = full.index_select(1, self.gather_idx)
+        if self.presence is not None:
+            full = torch.cat([full, presence_outputs(self.presence, x)], dim=1)
         return full

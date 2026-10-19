@@ -4,7 +4,7 @@ import numpy as np
 import torch
 
 import config as C
-from model_dual import build_eye_tower, MergedDualEye, build_consensus_heads, expr_feat_dim
+from model_dual import build_eye_tower, MergedDualEye, build_consensus_heads, expr_feat_dim, gaze_net_for
 
 
 def _load_consensus(ec, tower):
@@ -24,22 +24,23 @@ def load_merged_tower(gaze_ckpt, expr_ckpt, device="cpu"):
     gaze_sd = gc.get("gaze", gc.get("student", gc)) if isinstance(gc, dict) else gc
     assert set(expr_sd) == set(tower.expr.state_dict()), "expr ckpt keys don't match tower.expr"
     tower.expr.load_state_dict(expr_sd)
+    tower.gaze = gaze_net_for(gaze_sd)   # the selected checkpoint may be the max-pooled baseline
     tower.gaze.load_state_dict(gaze_sd)
     consensus = _load_consensus(ec, tower)
     return tower.to(device).eval(), backbone, (consensus.to(device) if consensus is not None else None)
 
 
-def export(gaze_ckpt, expr_ckpt, out_path, check=False):
-    """Merge the gaze + expr checkpoints and export the single ONNX."""
+def export(gaze_ckpt, expr_ckpt, out_path, check=False, presence=None):
+    """Merge the gaze + expr checkpoints (and optional presence module) and export the single ONNX."""
     tower, backbone, consensus = load_merged_tower(gaze_ckpt, expr_ckpt, "cpu")
-    _export_tower(tower, backbone, out_path, check, consensus)
+    _export_tower(tower, backbone, out_path, check, consensus, presence)
 
 
-def _export_tower(tower, backbone, out_path, check=False, consensus=None):
+def _export_tower(tower, backbone, out_path, check=False, consensus=None, presence=None):
     import onnx
     device = "cpu"
-    merged = MergedDualEye(tower, consensus).to(device).eval()
-    names = C.BLENDSHAPE_NAMES_CONSENSUS if consensus is not None else C.BLENDSHAPE_NAMES
+    merged = MergedDualEye(tower, consensus, presence).to(device).eval()
+    names = C.output_names(consensus is not None, presence is not None)
 
     S, IN = C.DUAL_INPUT_SIZE, 2 * C.TEMPORAL_FRAMES
     dummy = torch.randn(1, IN, S, S, device=device)

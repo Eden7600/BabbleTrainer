@@ -10,41 +10,18 @@ import config as C
 import device as Dev
 import bin_temporal_dataset as TD
 from model import _cpu_state_dict, EMATeacher
-from model_dual import build_gaze_net, warm_start_gaze
+from model_dual import build_gaze_net, warm_start_gaze, gaze_state, gaze_net_for
 from train_dual import default_workers
+import training_progress as Progress
+import evaluation as Eval
 
 GAZE_A, GAZE_B = C.GAZE_SLICE     # (0, 2)
 
 
 def save_gaze_checkpoint(path, net, step, extra=None):
-    torch.save({"gaze": _cpu_state_dict(net), "step": step, "arch": "microchad",
+    torch.save({"gaze": _cpu_state_dict(net), "step": step, "arch": "microchad_spatial" if net.spatial else "microchad",
                 **(extra or {})}, path)
 
-
-@torch.no_grad()
-def evaluate_gaze(net, ds, device, n=4000):
-    net.eval()
-    idx = np.random.default_rng(0).choice(len(ds), size=min(n, len(ds)), replace=False)
-    preds, tgts, gvs = [], [], []
-    for s in range(0, len(idx), 256):
-        batch = [ds[int(j)] for j in idx[s:s + 256]]
-        x = Dev.to_input(torch.stack([b[0] for b in batch]), device)
-        with Dev.autocast_ctx(device):
-            preds.append(net(x).float().cpu())
-        tgts.append(torch.stack([b[1] for b in batch]))
-        gvs.append(torch.stack([b[2] for b in batch]))
-    p = torch.cat(preds).clamp(0, 1).numpy()                 # [N,2]
-    t = torch.cat(tgts).numpy()[:, GAZE_A:GAZE_B]            # [N,2]
-    gv = torch.cat(gvs).numpy() > 0.5
-    sel = gv if gv.any() else np.ones(len(p), bool)
-    mse = float(((p[sel] - t[sel]) ** 2).mean())
-    mae_deg = float(np.abs(p[sel] - t[sel]).mean()) * 2 * C.GAZE_RANGE_DEG
-    rs = []
-    for c in range(GAZE_B - GAZE_A):
-        tc, pc = t[sel, c], p[sel, c]
-        rs.append(float(np.corrcoef(tc, pc)[0, 1]) if tc.std() > 1e-6 and pc.std() > 1e-6 else 0.0)
-    net.train()
-    return mse, rs, mae_deg
 
 
 def fit_gaze(train_ds, val_ds, *, steps=C.GAZE_STEPS, batch=C.GAZE_BATCH, workers=None,
@@ -92,15 +69,27 @@ def fit_gaze(train_ds, val_ds, *, steps=C.GAZE_STEPS, batch=C.GAZE_BATCH, worker
 
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     best = float("inf")
+    best_report = None
+    baseline_report = None
+    if init:
+        # The baseline is the shipped network itself, even when the tuned head has a different shape.
+        shipped = gaze_state(init)
+        baseline = Dev.model_to(gaze_net_for(shipped), device)
+        baseline.load_state_dict(shipped)
+        baseline_report = Eval.evaluate_gaze_report(baseline.eval(), val_ds, device)
+        save_gaze_checkpoint(ckpt_dir / "baseline.pt", baseline, -1, {"validation": baseline_report})
+        del baseline
+    net.train()
     last_loss = 0.0
     t0 = time.time()
     if log == "frontend" and emit_header:
         print("\n=== Epoch 1/1 ===\n", flush=True)
     it = iter(loader)
     for step in range(steps):
-        imgs, tgt, _gv = next(it)
+        imgs, tgt, _gv, valid = next(it)
         imgs = Dev.to_input(imgs, device)
         tgt = tgt.to(device)
+        valid = valid.to(device)[:, GAZE_A:GAZE_B].float()
 
         if step < warmup:
             cur = lr * (step + 1) / warmup
@@ -111,7 +100,7 @@ def fit_gaze(train_ds, val_ds, *, steps=C.GAZE_STEPS, batch=C.GAZE_BATCH, worker
 
         with Dev.autocast_ctx(device):
             pred = net(imgs)
-            loss = F.mse_loss(pred, tgt[:, GAZE_A:GAZE_B]) 
+            loss = (((pred - tgt[:, GAZE_A:GAZE_B]) ** 2) * valid).sum() / valid.sum().clamp_min(1)
             if use_aj:
                 # UNLABELED footage stream consistency + temporal only here
                 try:
@@ -133,6 +122,8 @@ def fit_gaze(train_ds, val_ds, *, steps=C.GAZE_STEPS, batch=C.GAZE_BATCH, worker
                     l_temp = (F.relu(d - margin) ** 2).mean(dim=1)
                     loss = loss + lambda_temp * (l_temp * pair_ok).sum() / pair_ok.sum().clamp_min(1.0)
 
+        if not torch.isfinite(loss):
+            raise ValueError("Gaze optimization produced a non-finite loss")
         opt.zero_grad()
         scaler.scale(loss).backward()
         scaler.step(opt)
@@ -141,25 +132,34 @@ def fit_gaze(train_ds, val_ds, *, steps=C.GAZE_STEPS, batch=C.GAZE_BATCH, worker
             teacher.update(net)
         last_loss = float(loss.item())
 
-        if log == "frontend":
+        Progress.emit("gaze", step + 1, steps, {"train_loss": last_loss})
+        if log == "frontend" and not Progress.structured():
             print("\rBatch %u/%u, Loss: %.6f" % (progress_offset + step + 1, total, last_loss),
                   end="", flush=True)
 
         if step % val_every == 0 or step == steps - 1:
-            vmse, vr, gmae = evaluate_gaze(deployed(), val_ds, device)
+            report = Eval.evaluate_gaze_report(deployed().eval(), val_ds, device)
+            vmse, vr, gmae = Eval.score(report, "gaze"), [], Eval.score(report, "gaze") * 2 * C.GAZE_RANGE_DEG
+            net.train()
             tag = ""
             if vmse < best:
                 best = vmse
+                best_report = report
                 save_gaze_checkpoint(ckpt_dir / "model_best.pt", deployed(), step,
-                                     {"val_gaze_mse": vmse, "val_gaze_mae_deg": gmae})
+                                     {"validation": report, "val_gaze_mae_deg": gmae})
                 tag = " *"
             if log == "plain":
                 sps = (time.time() - t0) / (step + 1)
                 rstr = " ".join(f"{nm}={r:.2f}" for nm, r in zip(C.DUAL_PER_EYE[GAZE_A:GAZE_B], vr))
-                print(f"[{step:5d}/{steps}] loss={last_loss:.4f} val_gaze_mse={vmse:.4f} "
+                print(f"[{step:5d}/{steps}] loss={last_loss:.4f} validation_macro_mae={vmse:.4f} "
                       f"r({rstr}) gazeMAE={gmae:.1f}deg ({sps:.2f}s/step){tag}", flush=True)
 
     save_gaze_checkpoint(ckpt_dir / "model_last.pt", deployed(), steps)
     if log == "frontend" and emit_completion:
-        print("\nEpoch 1/1 completed in %.2fs. Average loss: %.6f\n" % (time.time() - t0, last_loss), flush=True)
-    return ckpt_dir / "model_best.pt", best
+        print("\nGaze stage completed in %.2fs. Last batch loss: %.6f\n" % (time.time() - t0, last_loss), flush=True)
+    chosen, reason = True, "No compatible warm-start baseline available"
+    if baseline_report is not None:
+        chosen, reason = Eval.choose_candidate(baseline_report, best_report, "gaze")
+    return (ckpt_dir / ("model_best.pt" if chosen else "baseline.pt"),
+            {"selected": "tuned" if chosen else "baseline", "reason": reason,
+             "baseline": baseline_report, "tuned": best_report})

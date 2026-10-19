@@ -6,15 +6,21 @@ import torch
 
 
 def get_device():
-    """DirectML (any-vendor GPU on Windows), falling back to CPU if torch_directml is unavailable.
-    DEVICE=cpu forces CPU."""
-    if os.environ.get("DEVICE", "auto").lower() == "cpu":
+    """Prefer CUDA, then DirectML; CPU remains an explicit or initialization-time choice."""
+    requested = os.environ.get("DEVICE", "auto").strip().lower()
+    if requested == "cpu":
         return torch.device("cpu")
+    if requested == "cuda" or (requested in ("", "auto") and torch.cuda.is_available()):
+        return torch.device("cuda")
+    if requested not in ("", "auto", "directml"):
+        raise ValueError("DEVICE must be cpu, cuda, auto, or directml")
     try:
         import torch_directml
         return torch_directml.device()
-    except Exception:
-        return torch.device("cpu")
+    except Exception as exc:
+        if requested in ("", "auto"):
+            return torch.device("cpu")
+        raise RuntimeError("Explicit DirectML backend could not initialize; choose DEVICE=cpu for a new run") from exc
 
 
 def autocast_ctx(device):

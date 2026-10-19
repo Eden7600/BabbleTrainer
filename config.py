@@ -41,6 +41,8 @@ GAZE_BATCH = 32             # ref make_batch
 GAZE_WARMUP = 500          # 5 "epochs" x 100 steps (ref EPOCH_SIZE), linear
 GAZE_ETA_MIN = 1e-6        # cosine floor (ref eta_min; NOT 0)
 GAZE_STEPS = 3200         # per-user budget (ref GAZE_EPOCHS=32 x EPOCH_SIZE=100)
+# Gaze head sees MicroChad's 4x4 grid instead of a global max (~4% lower MAE, benchmarks/gaze_arch_experiment.py).
+GAZE_SPATIAL = os.environ.get("GAZE_SPATIAL", "1") != "0"
 GAZE_CLOSED_RATIO = 0.20   # sampler: 80% gaze-valid / 20% eyes-closed (ref batcher_gaze f>0.8)
 GAZE_CLOSED_LID_THRESH = 0.5  # "eyes closed" = EyeLid (=1-lid) > this
 EXPR_STEPS = 4000          # per-user expression-loop budget
@@ -101,6 +103,12 @@ LAMBDA_CONSENSUS = 1.0               # weight of the consensus-head loss (head-o
 CONSENSUS_GROUPS = [[1, 2], [3]]
 CONSENSUS_NAMES = ["combinedEyeWiden", "combinedEyeSquint", "combinedEyeBrow"]
 BLENDSHAPE_NAMES_CONSENSUS = BLENDSHAPE_NAMES + CONSENSUS_NAMES
+# Optional headset-worn probability per eye, appended after every other output.
+PRESENCE_NAMES = [side + "EyePresent" for side in OUTPUT_SIDE_ORDER]
+
+
+def output_names(consensus, presence=False):
+    return (BLENDSHAPE_NAMES_CONSENSUS if consensus else BLENDSHAPE_NAMES) + (PRESENCE_NAMES if presence else [])
 
 if "FUSE_CHANNELS" in os.environ:
     EXPR_FUSE_CHANNELS = [int(x) for x in os.environ["FUSE_CHANNELS"].split(",") if x.strip()]
