@@ -156,12 +156,16 @@ def train(args, run_id):
             with torch.no_grad():
                 auto_labels["open_lid_windows"] = RA.confirm_open(datasets, [probe, val_expr], predict)
                 if len(RA.ramp_rows(train_expr)):
-                    auto_labels["ramp"] = RA.align(datasets, probe, predict)
+                    auto_labels["ramp"] = RA.align(datasets, [probe, val_expr], predict)
             del probe_net
             message = f"Confirmed {auto_labels['open_lid_windows']} open-eye windows"
             if "ramp" in auto_labels:
-                message += f"; ramp labels shifted by {auto_labels['ramp']['lag_ms']} ms reaction lag"
+                message += f"; ramp labels shifted by {auto_labels['ramp']['lag_ms']} ms and shaped on {auto_labels['ramp']['shaped_blocks']} blocks"
             Progress.emit("preparing", message=message + ".")
+        # Ramp labels are derived, so they may teach but never judge: stage and baseline selection only
+        # compares candidates on the real holds (with ramp frames scored, selection kept a worse stage).
+        for ds in (val_expr, val_paired.base):
+            ds.label_mask[RA.ramp_rows(ds), 2:] = False
         coverage, preserve_channels = expression_coverage(train_expr, val_expr, val_paired)
         missing_endpoints = missing_expression_endpoints(coverage)
         if not train_gaze.label_mask[:, :2].any() or not val_gaze.label_mask[:, :2].any():

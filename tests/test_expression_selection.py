@@ -16,13 +16,13 @@ import evaluation as E
 import train_dual as T
 
 
-def report(active_error, inactive_error, other_error=.1):
+def report(active_error, inactive_error, other_error=.1, names=("rightEyeSquint", "leftEyeSquint")):
     target = np.array([[1., 1.], [0., 0.], [0., 0.], [0., 0.]])
     pred = np.array([[1 - active_error, 1 - other_error],
                      [inactive_error, other_error], [inactive_error, other_error],
                      [inactive_error, other_error]])
     return E.summarize(pred, target, np.ones_like(target, bool),
-                       ["squint", "open", "gaze", "brow"], ["rightEyeSquint", "leftEyeSquint"])
+                       ["squint", "open", "gaze", "brow"], list(names))
 
 
 class ExpressionSelectionTests(unittest.TestCase):
@@ -61,6 +61,12 @@ class ExpressionSelectionTests(unittest.TestCase):
     def test_inactive_false_activations_are_guarded_too(self):
         self.assertFalse(E.choose_candidate(report(.6, .01), report(.1, .04))[0])
         self.assertTrue(E.choose_candidate(report(.6, .1), report(.2, .11))[0])
+
+    def test_open_lid_cohort_tolerates_small_drift_but_not_large(self):
+        lids = ("rightEyeLid", "leftEyeLid")
+        # Open-lid labels come from frames the baseline already reads as open, so it starts near zero.
+        self.assertTrue(E.choose_candidate(report(.22, .035, names=lids), report(.14, .057, names=lids))[0])
+        self.assertFalse(E.choose_candidate(report(.22, .035, names=lids), report(.14, .10, names=lids))[0])
 
     def test_masked_channels_and_intermediate_cohorts(self):
         out = E.summarize([[.9, .6], [.9, .7]], [[0, .5], [1, .5]],
