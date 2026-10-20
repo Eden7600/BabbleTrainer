@@ -40,7 +40,7 @@ def _export_tower(tower, backbone, out_path, check=False, consensus=None, presen
     import onnx
     device = "cpu"
     merged = MergedDualEye(tower, consensus, presence).to(device).eval()
-    names = C.output_names(consensus is not None, presence is not None)
+    names = C.output_names(consensus is not None, presence is not None, getattr(presence, "pupil", False))
 
     S, IN = C.DUAL_INPUT_SIZE, 2 * C.TEMPORAL_FRAMES
     dummy = torch.randn(1, IN, S, S, device=device)

@@ -97,10 +97,22 @@ class SegModel:
         p = float(self.torch.sigmoid(presence)[0]) if self.net.has_presence else np.nan
         return logits.argmax(1)[0].numpy().astype(np.uint8), p
 
+    def state(self, eye):
+        """(openness, pupil ratio, pupil-visible probability) from the eye-state head, or None without one."""
+        if not getattr(self.net, "has_state", False):
+            return None
+        x = self.torch.from_numpy(cv2.equalizeHist(eye)).float().div(255)[None, None]
+        with self.torch.no_grad():
+            _, openness, pupil, visible = self.net.eye_state(x)
+        return float(openness[0]), float(pupil[0]), float(self.torch.sigmoid(visible)[0])
+
 
 def default_seg():
-    runs = Path(__file__).parent / "runs/seg"
-    return str(runs / "seg_presence.pt") if (runs / "seg_presence.pt").exists() else str(runs / "seg_best.pt")
+    root = Path(__file__).parent / "runs"
+    for candidate in (root / "state/seg_state.pt", root / "seg/seg_presence.pt", root / "seg/seg_best.pt"):
+        if candidate.exists():
+            return str(candidate)
+    return str(root / "seg/seg_best.pt")
 
 
 class PresenceGate:
@@ -466,6 +478,10 @@ def camera(args):
                 bar(canvas, x0 + 110, yy, 200, pred[col] if pred is not None and col is not None else None, ORANGE)
             o, p, iw = geo[e]
             text(canvas, f"open {o:.2f}  pupil/iris {p:.2f}  iris {iw:.0f}px", x0 + 330, y0 + 44, CYAN, .45)
+            st = seg.state(eyes[e]) if seg else None
+            if st:   # what the exported model reports: its own openness and pupil, gated by pupil visibility
+                text(canvas, f"model: open {st[0]:.2f}  pupil {st[1]:.2f}" + ("" if st[2] > .5 else " (hidden)"),
+                     x0 + 330, y0 + 76, (120, 200, 255), .45)
             bar(canvas, x0 + 330, y0 + 56, 150, o / 1.2 if np.isfinite(o) else None, CYAN)
         ts = [s[0] for s in trace]
         series = []

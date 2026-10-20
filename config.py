@@ -103,12 +103,15 @@ LAMBDA_CONSENSUS = 1.0               # weight of the consensus-head loss (head-o
 CONSENSUS_GROUPS = [[1, 2], [3]]
 CONSENSUS_NAMES = ["combinedEyeWiden", "combinedEyeSquint", "combinedEyeBrow"]
 BLENDSHAPE_NAMES_CONSENSUS = BLENDSHAPE_NAMES + CONSENSUS_NAMES
-# Optional headset-worn probability per eye, appended after every other output.
+# Optional eye-state outputs, appended after every other output: headset-worn probability per eye, then
+# (when the eye-state model has them) pupil/iris ratio and pupil-visible probability per eye.
 PRESENCE_NAMES = [side + "EyePresent" for side in OUTPUT_SIDE_ORDER]
+PUPIL_NAMES = [side + "EyePupil" for side in OUTPUT_SIDE_ORDER] + [side + "EyePupilVisible" for side in OUTPUT_SIDE_ORDER]
 
 
-def output_names(consensus, presence=False):
-    return (BLENDSHAPE_NAMES_CONSENSUS if consensus else BLENDSHAPE_NAMES) + (PRESENCE_NAMES if presence else [])
+def output_names(consensus, presence=False, pupil=False):
+    return ((BLENDSHAPE_NAMES_CONSENSUS if consensus else BLENDSHAPE_NAMES) + (PRESENCE_NAMES if presence else [])
+            + (PUPIL_NAMES if pupil else []))
 
 if "FUSE_CHANNELS" in os.environ:
     EXPR_FUSE_CHANNELS = [int(x) for x in os.environ["FUSE_CHANNELS"].split(",") if x.strip()]

@@ -8,7 +8,8 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import model_dual as M
 
-SHIPPED = Path(__file__).resolve().parents[1] / "dist/matched-reliable-v5b"
+# The shipped checkpoints live with the app: Baballonia/src/Baballonia.Desktop/Calibration/Windows/Trainer.
+SHIPPED = Path(__file__).resolve().parents[2] / "Baballonia/src/Baballonia.Desktop/Calibration/Windows/Trainer"
 
 
 @unittest.skipUnless((SHIPPED / "gaze_model_best.pt").exists(), "shipped checkpoints not present")
@@ -58,13 +59,14 @@ class PresenceExportTests(unittest.TestCase):
             out = Path(tmp) / "eye.onnx"
             export(str(SHIPPED / "gaze_model_best.pt"), str(SHIPPED / "model_best.pt"), str(out), presence=presence)
             names = json.loads({p.key: p.value for p in onnx.load(out).metadata_props}["blendshape_names"])
-            self.assertEqual(C.PRESENCE_NAMES, names[-2:])
+            self.assertEqual(C.PRESENCE_NAMES + C.PUPIL_NAMES, names[-6:])
             x = torch.zeros(1, 8, 128, 128)
             x[:, C.EXPORT_FLIP_CH[0]] = torch.rand(128, 128)   # only the eye that feeds right* gets an image
             sess = ort.InferenceSession(str(out), providers=["CPUExecutionProvider"])
             y = sess.run(None, {sess.get_inputs()[0].name: x.numpy()})[0][0]
             with torch.no_grad():
-                right = presence(x[:, C.EXPORT_FLIP_CH[0]:C.EXPORT_FLIP_CH[0] + 1]).item()
-                left = presence(x[:, C.EXPORT_NOFLIP_CH[0]:C.EXPORT_NOFLIP_CH[0] + 1]).item()
-            self.assertAlmostEqual(right, y[names.index("rightEyePresent")], places=4)
-            self.assertAlmostEqual(left, y[names.index("leftEyePresent")], places=4)
+                right = presence(x[:, C.EXPORT_FLIP_CH[0]:C.EXPORT_FLIP_CH[0] + 1])[0].numpy()
+                left = presence(x[:, C.EXPORT_NOFLIP_CH[0]:C.EXPORT_NOFLIP_CH[0] + 1])[0].numpy()
+            for k, quantity in enumerate(("EyePresent", "EyePupil", "EyePupilVisible")):
+                self.assertAlmostEqual(right[k], y[names.index("right" + quantity)], places=4)
+                self.assertAlmostEqual(left[k], y[names.index("left" + quantity)], places=4)

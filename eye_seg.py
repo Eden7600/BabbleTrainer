@@ -127,6 +127,7 @@ class EyeSegNet(nn.Module):
         self.up = nn.ModuleList(_block(ch[i] + ch[i + 1], ch[i]) for i in reversed(range(len(ch) - 1)))
         self.head = nn.Conv2d(ch[0], CLASSES, 1)
         self.presence = nn.Linear(ch[-1], 1)  # logit: is an eye region (open or closed) in front of the camera
+        self.state = nn.Linear(ch[-1], 3)     # lid openness, pupil/iris ratio, pupil-visible logit
 
     def forward(self, x, with_presence=False):
         skips = []
@@ -139,25 +140,36 @@ class EyeSegNet(nn.Module):
         return (self.head(x), presence) if with_presence else self.head(x)
 
 
-    def presence_logit(self, x):
-        """Encoder-only path for the presence head (no decoder), as deployed in the eye model."""
+    def _pooled(self, x):
         for i, block in enumerate(self.down):
             x = block(x if i == 0 else F.max_pool2d(x, 2))
-        return self.presence(x.mean((2, 3)))[:, 0]
+        return x.mean((2, 3))
+
+    def presence_logit(self, x):
+        """Encoder-only path for the presence head (no decoder), as deployed in the eye model."""
+        return self.presence(self._pooled(x))[:, 0]
+
+    def eye_state(self, x):
+        """Encoder-only (presence logit, openness, pupil ratio, pupil-visible logit), each shaped [B]."""
+        f = self._pooled(x)
+        s = self.state(f)
+        return self.presence(f)[:, 0], s[:, 0], torch.sigmoid(s[:, 1]), s[:, 2]
 
 
 def load_seg(path):
     net = EyeSegNet()
     missing, _ = net.load_state_dict(torch.load(path, map_location="cpu", weights_only=True)["model"], strict=False)
-    if any(not k.startswith("presence.") for k in missing):
+    if any(not k.startswith(("presence.", "state.")) for k in missing):
         raise ValueError(f"segmentation checkpoint is missing {missing}")
-    net.has_presence = not missing
+    net.has_presence = not any(k.startswith("presence.") for k in missing)
+    net.has_state = not any(k.startswith("state.") for k in missing)
     return net
 
 
 def dice_loss(logits, target):
     p = logits.softmax(1)
-    t = F.one_hot(target, CLASSES).permute(0, 3, 1, 2).float()
+    # Comparison instead of F.one_hot, which DirectML cannot scatter.
+    t = (target[:, None] == torch.arange(CLASSES, device=target.device)[None, :, None, None]).float()
     inter = (p * t).sum((0, 2, 3))
     return 1 - ((2 * inter + 1) / (p.sum((0, 2, 3)) + t.sum((0, 2, 3)) + 1))[1:].mean()
 
@@ -242,11 +254,27 @@ def _synthetic_absent(rng):
     return (np.clip(f, 0, 1) * 255).astype(np.uint8)
 
 
-class EyeFrames(Dataset):
-    """Unsegmented 128x128 eye crops with a presence label (mask is ignored when has_mask is 0)."""
+NO_STATE = (np.nan, np.nan, 0.0)   # headset off: nothing to measure, and no pupil is visible
 
-    def __init__(self, images, present, train, absent_mask=False):
+
+def state_targets(mask):
+    """(openness, pupil ratio, pupil visible) from a class mask; NaN where the geometry is unknown."""
+    openness, pupil, _ = geometry(mask)
+    return float(openness), float(pupil), float(np.isfinite(pupil))
+
+
+def _state(targets):
+    t = torch.tensor(targets, dtype=torch.float32)
+    return torch.nan_to_num(t), torch.isfinite(t)
+
+
+class EyeFrames(Dataset):
+    """Unsegmented 128x128 eye crops with a presence label (mask is ignored when has_mask is 0) and optional
+    per-frame state targets."""
+
+    def __init__(self, images, present, train, absent_mask=False, state=None):
         self.images, self.present, self.train, self.absent_mask = images, float(present), train, absent_mask
+        self.state = state
 
     def __len__(self):
         return len(self.images)
@@ -256,8 +284,9 @@ class EyeFrames(Dataset):
         img = _photometric(self.images[i], rng) if self.train else self.images[i]
         img = cv2.equalizeHist(np.ascontiguousarray(img))
         # A frame with no eye has an all-background mask, so absent frames also supervise segmentation.
+        targets = tuple(self.state[i]) if self.state is not None else (NO_STATE if not self.present else (np.nan,) * 3)
         return (torch.from_numpy(img).float().div(255)[None], torch.zeros(SIZE, SIZE, dtype=torch.long),
-                torch.tensor(self.present), torch.tensor(float(self.absent_mask)))
+                torch.tensor(self.present), torch.tensor(float(self.absent_mask)), *_state(targets))
 
 
 class SyntheticAbsent(Dataset):
@@ -270,7 +299,7 @@ class SyntheticAbsent(Dataset):
     def __getitem__(self, i):
         img = cv2.equalizeHist(_synthetic_absent(np.random.default_rng()))
         return (torch.from_numpy(img).float().div(255)[None], torch.zeros(SIZE, SIZE, dtype=torch.long),
-                torch.tensor(0.), torch.tensor(1.))
+                torch.tensor(0.), torch.tensor(1.), *_state(NO_STATE))
 
 
 class WithPresence(Dataset):
@@ -282,7 +311,7 @@ class WithPresence(Dataset):
 
     def __getitem__(self, i):
         x, y = self.base[i]
-        return x, y, torch.tensor(1.), torch.tensor(1.)
+        return x, y, torch.tensor(1.), torch.tensor(1.), *_state(state_targets(y.numpy()))
 
 
 def capture_eyes(bin_path, every=3):
@@ -309,18 +338,48 @@ def clip_eyes(paths, val_frac=.25):
 
 
 @torch.no_grad()
-def presence_scores(net, ds, device, limit=4000):
+def pseudo_state(net, images, device, batch=256):
+    """State targets for unlabeled frames from the segmentation net's own masks, kept only where they are
+    clear: the iris is plainly visible, or the eye is plainly closed (no eye pixels at all)."""
+    net.eval()
+    out = []
+    for start in range(0, len(images), batch):
+        x = torch.stack([torch.from_numpy(cv2.equalizeHist(np.ascontiguousarray(im))).float().div(255)[None]
+                         for im in images[start:start + batch]]).to(device)
+        for mask in net(x).argmax(1).cpu().numpy():
+            openness, pupil, width = geometry(mask)
+            clear = width >= MIN_IRIS_PX or (mask > 0).sum() < 8
+            out.append((openness if clear else np.nan, pupil if clear else np.nan, float(np.isfinite(pupil))))
+    return np.array(out, np.float32)
+
+
+@torch.no_grad()
+def state_scores(net, ds, device, limit=4000):
+    """Presence probability plus state predictions and targets for a dataset."""
     net.eval()
     idx = np.linspace(0, len(ds) - 1, min(limit, len(ds))).astype(int)
-    out = []
+    rows = []
     for start in range(0, len(idx), 256):
-        x = torch.stack([ds[int(i)][0] for i in idx[start:start + 256]]).to(device)
-        out.append(torch.sigmoid(net(x, with_presence=True)[1]).cpu().numpy())
+        items = [ds[int(i)] for i in idx[start:start + 256]]
+        x = torch.stack([it[0] for it in items]).to(device)
+        presence, openness, pupil, visible = net.eye_state(x)
+        pred = torch.stack([torch.sigmoid(presence), openness, pupil, torch.sigmoid(visible)], 1).cpu().numpy()
+        target = torch.stack([it[4] for it in items]).numpy()
+        ok = torch.stack([it[5] for it in items]).numpy()
+        rows.append((pred, target, ok))
     net.train()
-    return np.concatenate(out) if out else np.zeros(0)
+    pred, target, ok = (np.concatenate(r) for r in zip(*rows))
+    report = {"presence": round(float(pred[:, 0].mean()), 3)}
+    for k, name in ((0, "openness_mae"), (1, "pupil_ratio_mae")):
+        if ok[:, k].any():
+            report[name] = round(float(np.abs(pred[ok[:, k], k + 1] - target[ok[:, k], k]).mean()), 4)
+    if ok[:, 2].any():
+        report["pupil_visible_acc"] = round(float(((pred[ok[:, 2], 3] > .5) == (target[ok[:, 2], 2] > .5)).mean()), 4)
+    return report
 
 
-def train_presence(args):
+def train_state(args):
+    """Fine-tune the segmentation net's headset-worn (presence) and eye-state heads."""
     from torch.utils.data import ConcatDataset, WeightedRandomSampler
     torch.manual_seed(C.SEED); np.random.seed(C.SEED); random.seed(C.SEED)
     device = Dev.get_device()
@@ -335,40 +394,50 @@ def train_presence(args):
           f"captures {len(worn_tr)}/{len(worn_va)} eye frames (train/val)", flush=True)
     if not absent_tr:
         raise SystemExit("No absent_*.npz clips found; record headset-off clips with eye_viewer.py camera (n).")
-    groups = [WithPresence(OpenEDSSeg(args.root, "train")), EyeFrames(worn_tr, 1, True), EyeFrames(present_tr, 1, True),
+    net = load_seg(args.init).to(device)
+    labeller = load_seg(args.init).to(device)   # frozen copy labels the unsegmented frames once
+    state = {name: pseudo_state(labeller, images, device) for name, images in
+             (("worn_tr", worn_tr), ("worn_va", worn_va), ("present_tr", present_tr), ("present_va", present_va))}
+    del labeller
+    groups = [WithPresence(OpenEDSSeg(args.root, "train")), EyeFrames(worn_tr, 1, True, state=state["worn_tr"]),
+              EyeFrames(present_tr, 1, True, state=state["present_tr"]),
               EyeFrames(absent_tr, 0, True, absent_mask=True), SyntheticAbsent(20000)]
     share = [.35, .25, .1, .2, .1]   # sampling share per group, independent of group size
     weights = np.concatenate([np.full(len(g), s / max(len(g), 1)) for g, s in zip(groups, share)])
     loader = DataLoader(ConcatDataset(groups), batch_size=args.batch, num_workers=args.workers, drop_last=True,
                         sampler=WeightedRandomSampler(torch.as_tensor(weights), args.steps * args.batch, replacement=True))
-    net = load_seg(args.init).to(device)
     opt = torch.optim.AdamW(net.parameters(), lr=args.lr, weight_decay=1e-4)
     sched = torch.optim.lr_scheduler.OneCycleLR(opt, args.lr, total_steps=args.steps, pct_start=.1)
     weight = torch.tensor([.5, 1, 1, 2], device=device)
     val_eds = OpenEDSSeg(args.root, "val")
-    val_sets = {"captures (worn)": EyeFrames(worn_va, 1, False), "present clip": EyeFrames(present_va, 1, False),
+    val_sets = {"openeds": WithPresence(val_eds), "captures (worn)": EyeFrames(worn_va, 1, False, state=state["worn_va"]),
+                "present clip": EyeFrames(present_va, 1, False, state=state["present_va"]),
                 "absent clip": EyeFrames(absent_va, 0, False)}
     out = Path(args.out); out.mkdir(parents=True, exist_ok=True)
-    for step, (x, y, present, has_mask) in enumerate(loader, 1):
+    for step, (x, y, present, has_mask, target, ok) in enumerate(loader, 1):
         x, y, present, has_mask = x.to(device), y.to(device), present.to(device), has_mask.to(device).bool()
+        target, ok = target.to(device), ok.to(device)
         logits, p_logit = net(x, with_presence=True)
+        _, openness, pupil, visible = net.eye_state(x)
         loss = F.binary_cross_entropy_with_logits(p_logit, present)
         if has_mask.any():
             loss = loss + F.cross_entropy(logits[has_mask], y[has_mask], weight=weight) + dice_loss(logits[has_mask], y[has_mask])
+        if ok[:, 0].any():
+            loss = loss + F.smooth_l1_loss(openness[ok[:, 0]], target[ok[:, 0], 0], beta=.05)
+        if ok[:, 1].any():
+            loss = loss + 4 * F.l1_loss(pupil[ok[:, 1]], target[ok[:, 1], 1])   # ratios span ~0.2-0.7
+        if ok[:, 2].any():
+            loss = loss + F.binary_cross_entropy_with_logits(visible[ok[:, 2]], target[ok[:, 2], 2])
         opt.zero_grad(); loss.backward(); opt.step(); sched.step()
         if step % 500 == 0 or step == args.steps:
-            report = {"step": step, "openeds": evaluate(net, val_eds, device, limit=1000)}
-            for name, ds in val_sets.items():
-                s = presence_scores(net, ds, device)
-                if len(s):
-                    report[name] = {"mean": round(float(s.mean()), 3),
-                                    "wrong": round(float(((s < .5) if ds.present else (s >= .5)).mean()), 4)}
+            report = {"step": step, "segmentation": evaluate(net, val_eds, device, limit=1000)}
+            report.update({name: state_scores(net, ds, device) for name, ds in val_sets.items()})
             line = json.dumps(report)
             print(line, flush=True)
             with open(out / "train.log", "a", encoding="utf-8") as log:
                 log.write(line + "\n")
-    torch.save({"model": net.state_dict(), "step": args.steps, "validation": report}, out / "seg_presence.pt")
-    print(f"saved {out / 'seg_presence.pt'}", flush=True)
+    torch.save({"model": net.state_dict(), "step": args.steps, "validation": report}, out / "seg_state.pt")
+    print(f"saved {out / 'seg_state.pt'}", flush=True)
 
 
 def main():
@@ -381,9 +450,9 @@ def main():
     t.add_argument("--batch", type=int, default=64)
     t.add_argument("--lr", type=float, default=3e-3)
     t.add_argument("--workers", type=int, default=8)
-    pr = sub.add_parser("presence", help="fine-tune the segmentation net with a headset-worn head")
+    pr = sub.add_parser("state", help="fine-tune the headset-worn (presence) and eye-state heads")
     pr.add_argument("root", help="OpenEDS root (keeps segmentation from drifting)")
-    pr.add_argument("--init", default="runs/seg/seg_best.pt")
+    pr.add_argument("--init", default="runs/seg/seg_presence.pt")
     pr.add_argument("--clips", default="runs/presence/clips")
     pr.add_argument("--captures", nargs="*", default=[str(p) for p in sorted(
         (Path.home() / "AppData/Roaming/ProjectBabble/ModelData/captures").glob("*/user_cal.bin"))
@@ -396,8 +465,8 @@ def main():
     args = ap.parse_args()
     if args.cmd == "train":
         train(args)
-    elif args.cmd == "presence":
-        train_presence(args)
+    elif args.cmd == "state":
+        train_state(args)
 
 
 if __name__ == "__main__":

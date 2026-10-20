@@ -31,8 +31,8 @@ def add_presence(src, dst, presence_ckpt):
     base = onnx.load(src)
     meta = {p.key: p for p in base.metadata_props}
     names = json.loads(meta["blendshape_names"].value)
-    if names[-len(C.PRESENCE_NAMES):] == C.PRESENCE_NAMES:
-        raise ValueError(f"{src} already has presence outputs")
+    if any(n in names for n in C.PRESENCE_NAMES):
+        raise ValueError(f"{src} already has eye-state outputs")
     graph = base.graph
     in_name, out_name = graph.input[0].name, graph.output[0].name
     opset = max(o.version for o in base.opset_import if o.domain in ("", "ai.onnx"))
@@ -58,10 +58,11 @@ def add_presence(src, dst, presence_ckpt):
     graph.node.extend(sub.graph.node)
     graph.initializer.extend(sub.graph.initializer)
     graph.node.append(helper.make_node("Concat", [base_out, "presence/presence"], [out_name], axis=1))
+    added = C.output_names(False, True, presence.pupil)[len(C.BLENDSHAPE_NAMES):]
     dims = graph.output[0].type.tensor_type.shape.dim
     if len(dims) == 2 and dims[1].HasField("dim_value"):
-        dims[1].dim_value += len(C.PRESENCE_NAMES)
-    meta["blendshape_names"].value = json.dumps(names + C.PRESENCE_NAMES)
+        dims[1].dim_value += len(added)
+    meta["blendshape_names"].value = json.dumps(names + added)
     onnx.checker.check_model(base)
     onnx.save(base, dst)
 
@@ -72,10 +73,10 @@ def add_presence(src, dst, presence_ckpt):
     new = ort.InferenceSession(dst, providers=["CPUExecutionProvider"]).run(None, {in_name: x})[0]
     with torch.no_grad():
         ref = _PresenceOnly(presence)(torch.from_numpy(x)).numpy()
-    assert new.shape == (2, len(names) + 2), new.shape
+    assert new.shape == (2, len(names) + len(added)), new.shape
     assert np.array_equal(new[:, :len(names)], old), "original outputs changed"
     assert np.abs(new[:, len(names):] - ref).max() < 1e-4, "presence outputs disagree with PyTorch"
-    return names + C.PRESENCE_NAMES
+    return names + added
 
 
 def main():

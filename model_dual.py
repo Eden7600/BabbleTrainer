@@ -181,31 +181,38 @@ def build_consensus_heads(feat_dim, groups=None, hidden=None) -> nn.ModuleList:
 
 
 class EyePresence(nn.Module):
-    """Headset-worn probability for one equalized 128x128 eye frame (the segmentation net's encoder + head)."""
+    """Eye state for one equalized 128x128 eye frame from the segmentation net's encoder: headset-worn
+    probability, plus pupil/iris ratio and pupil-visible probability when the checkpoint has state heads."""
 
     def __init__(self, seg):
         super().__init__()
         self.seg = seg
+        self.pupil = getattr(seg, "has_state", False)
 
     def forward(self, x):
-        return torch.sigmoid(self.seg.presence_logit(x))[:, None]
+        if not self.pupil:
+            return torch.sigmoid(self.seg.presence_logit(x))[:, None]
+        presence, _, pupil, visible = self.seg.eye_state(x)
+        return torch.stack([torch.sigmoid(presence), pupil, torch.sigmoid(visible)], 1)
 
 
 def load_presence(path) -> nn.Module:
     from eye_seg import load_seg
     seg = load_seg(path)
     if not seg.has_presence:
-        raise ValueError(f"{path} has no presence head; train it with eye_seg.py presence")
+        raise ValueError(f"{path} has no presence head; train it with eye_seg.py state")
     return EyePresence(seg).eval()
 
 
 def presence_outputs(presence, x):
-    """(B, 2) presence in output side order, from each eye's newest frame; mirrors MergedDualEye's side logic."""
+    """(B, 2 or 6) eye state in output side order from each eye's newest frame, grouped by quantity
+    (presence, then pupil, then pupil visible); mirrors MergedDualEye's side logic."""
     left = presence(x[:, C.EXPORT_NOFLIP_CH[0]:C.EXPORT_NOFLIP_CH[0] + 1])   # the un-flipped eye feeds leftEye*
     right = presence(x[:, C.EXPORT_FLIP_CH[0]:C.EXPORT_FLIP_CH[0] + 1])
     if C.SWAP_OUTPUT_SIDES:
         right, left = left, right
-    return torch.cat([right, left] if C.OUTPUT_SIDE_ORDER[0] == "right" else [left, right], dim=1)
+    first, second = (right, left) if C.OUTPUT_SIDE_ORDER[0] == "right" else (left, right)
+    return torch.cat([t for k in range(first.shape[1]) for t in (first[:, k:k + 1], second[:, k:k + 1])], dim=1)
 
 
 class MergedDualEye(nn.Module):

@@ -22,7 +22,8 @@ def write_artifacts(model_path, merged, paired, run_id, report):
     x, _, _ = paired_inputs(paired, paired_sample_indices(paired, 32))
     inputs = x.numpy().astype("<f4")
     expected = merged.cpu().eval()(x).numpy().astype("<f4")
-    names = C.output_names(merged.consensus is not None, getattr(merged, "presence", None) is not None)
+    presence = getattr(merged, "presence", None)
+    names = C.output_names(merged.consensus is not None, presence is not None, getattr(presence, "pupil", False))
     if not 1 <= len(inputs) <= 32 or expected.shape != (len(inputs), len(names)):
         raise ValueError("Invalid parity fixture shape")
     if not np.isfinite(inputs).all() or not np.isfinite(expected).all():
