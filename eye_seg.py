@@ -18,6 +18,7 @@ from torch.utils.data import DataLoader, Dataset
 
 import config as C
 import device as Dev
+from model import _cpu_state_dict   # DirectML tensors must be saved from CPU to load with weights_only
 
 SIZE = C.DUAL_INPUT_SIZE
 CLASSES = 4  # 0 background, 1 sclera, 2 iris, 3 pupil (OpenEDS convention)
@@ -225,7 +226,7 @@ def train(args):
                     log.write(line + "\n")
                 if score > best:
                     best = score
-                    torch.save({"model": net.state_dict(), "step": step, "validation": report}, out / "seg_best.pt")
+                    torch.save({"model": _cpu_state_dict(net), "step": step, "validation": report}, out / "seg_best.pt")
             if step >= args.steps:
                 break
 
@@ -436,7 +437,7 @@ def train_state(args):
             print(line, flush=True)
             with open(out / "train.log", "a", encoding="utf-8") as log:
                 log.write(line + "\n")
-    torch.save({"model": net.state_dict(), "step": args.steps, "validation": report}, out / "seg_state.pt")
+    torch.save({"model": _cpu_state_dict(net), "step": args.steps, "validation": report}, out / "seg_state.pt")
     print(f"saved {out / 'seg_state.pt'}", flush=True)
 
 
